@@ -603,7 +603,7 @@
 
     <div class="card">
       <h3>Import from spreadsheet (CSV)</h3>
-      <p class="hint">Columns: <strong>Family Code, Student ID, First Name, Last Name, Grade, Contact Name, Notes</strong> (case/spacing don't matter, header row required). One row per student — rows sharing the same Family Code (or the same Contact Name, if no Family Code) are grouped as siblings automatically.</p>
+      <p class="hint">Columns: <strong>Family Code, Student ID, First Name, Last Name, Grade, Teacher, Contact Name, Notes</strong> (case/spacing don't matter, header row required). One row per student — rows sharing the same Family Code (or the same Contact Name, if no Family Code) are grouped as siblings automatically. The Teacher column shows up as "PES" everywhere in the live app, coded rather than shown as-is.</p>
       <input type="file" id="csvFile" accept=".csv,text/csv" />
       <div id="csvPreview" style="margin-top:10px;"></div>
       <button class="btn btn-secondary" id="csvImportBtn" style="display:none;margin-top:10px;">Import into roster</button>
@@ -789,6 +789,15 @@
 
   const LOG_PATH = 'pickup-log.json';
 
+  // "PES" field — a real teacher name is stored per student, but this app
+  // never displays that name anywhere. Instead, every distinct teacher name
+  // gets a short code (assigned once, the first time it's saved, and reused
+  // forever after) stored in this small separate file. Only the code is
+  // ever shown on screen; the real name stays searchable but hidden.
+  const TEACHER_CODES_PATH = 'teacher-codes.json';
+  let teacherCodes = {}; // { normalizedTeacherName: "-X1", ... }
+  let teacherCodesSha = null;
+
   let settings = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
   let records = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]'); // [{id,tagCode,students:[{firstName,lastName,studentId,grade}],contactName,notes,createdAt,updatedAt}]
   let currentSha = null;
@@ -809,6 +818,7 @@
     if (!settings) { switchView('settings'); return; }
     await loadFromGithub(true);
     await loadQueueFromGithub(true);
+    await loadTeacherCodesFromGithub();
   });
 
   // Splits a raw "Jane Guzman; John Guzman" field into a clean array — same
@@ -831,17 +841,18 @@
   // Older records (saved before First/Last/ID/Grade existed) only have {name}.
   // This normalizes either shape into one consistent object everywhere else reads from.
   function studentFields(s){
-    if (s.firstName || s.lastName || s.studentId || s.grade) {
+    if (s.firstName || s.lastName || s.studentId || s.grade || s.teacher) {
       return {
         firstName: s.firstName || '',
         lastName: s.lastName || '',
         studentId: s.studentId || '',
-        grade: s.grade || ''
+        grade: s.grade || '',
+        teacher: s.teacher || ''
       };
     }
     const parts = (s.name || '').trim().split(/\s+/).filter(Boolean);
     const lastName = parts.length > 1 ? parts.pop() : '';
-    return { firstName: parts.join(' '), lastName, studentId: '', grade: '' };
+    return { firstName: parts.join(' '), lastName, studentId: '', grade: '', teacher: '' };
   }
 
   function studentDisplayName(s){
@@ -858,6 +869,7 @@
     const meta = [];
     if (grade) meta.push(escapeHtml(grade));
     if (f.studentId) meta.push('ID ' + escapeHtml(f.studentId));
+    if (f.teacher) meta.push('PES ' + escapeHtml(getTeacherCodeSync(f.teacher) || '—'));
     const missing = flagMissingId && !f.studentId;
     return `<div class="student-line${missing ? ' missing-id' : ''}"><strong>${escapeHtml(studentDisplayName(s))}</strong>${meta.length ? ` <span class="meta">· ${meta.join(' · ')}</span>` : ''}${missing ? ' <span class="missing-id-tag">No Student ID</span>' : ''}</div>`;
   }
@@ -869,9 +881,12 @@
   function studentCheckLineHtml(s, idx, carGradeFallback){
     const f = studentFields(s);
     const grade = f.grade || carGradeFallback || '';
+    const meta = [];
+    if (grade) meta.push(escapeHtml(grade));
+    if (f.teacher) meta.push('PES ' + escapeHtml(getTeacherCodeSync(f.teacher) || '—'));
     return `<label class="student-check-line">
       <input type="checkbox" class="lookup-student-check" data-student-idx="${idx}" checked>
-      <strong>${escapeHtml(studentDisplayName(s))}</strong>${grade ? ` <span class="meta">· ${escapeHtml(grade)}</span>` : ''}
+      <strong>${escapeHtml(studentDisplayName(s))}</strong>${meta.length ? ` <span class="meta">· ${meta.join(' · ')}</span>` : ''}
     </label>`;
   }
 
@@ -888,6 +903,9 @@
       <div class="row-2">
         <input class="sr-id" placeholder="Student ID (optional)" value="${escapeHtml(s.studentId || '')}">
         <input class="sr-grade" placeholder="Grade (optional)" value="${escapeHtml(s.grade || '')}">
+      </div>
+      <div class="row-2">
+        <input class="sr-teacher" placeholder="PES (optional)" value="${escapeHtml(s.teacher || '')}">
       </div>
       <div class="dup-student-warning" data-seq="${seq}" style="display:none;"></div>
       <button type="button" class="remove-student-row" data-seq="${seq}">Remove student</button>
@@ -920,7 +938,8 @@
       firstName: row.querySelector('.sr-first').value.trim(),
       lastName: row.querySelector('.sr-last').value.trim(),
       studentId: row.querySelector('.sr-id').value.trim(),
-      grade: row.querySelector('.sr-grade').value.trim()
+      grade: row.querySelector('.sr-grade').value.trim(),
+      teacher: row.querySelector('.sr-teacher').value.trim()
     })).filter(s => s.firstName || s.lastName);
   }
 
@@ -1139,6 +1158,61 @@
       console.error('Queue sync failed', e);
       if (showBusy) setSync('err', 'Queue sync failed — showing last saved copy');
     }
+  }
+
+  async function loadTeacherCodesFromGithub(){
+    if (!settings || !settings.owner || !settings.repo || !settings.token) return;
+    try {
+      const { data, sha } = await ghGetFile(TEACHER_CODES_PATH);
+      teacherCodes = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+      teacherCodesSha = sha;
+    } catch (e) {
+      console.error('Teacher-code lookup failed to load (PES field will still work once it loads)', e);
+    }
+  }
+
+  function normalizeTeacherKey(name){
+    return (name || '').trim().toLowerCase();
+  }
+
+  // Read-only, synchronous — safe to call while rendering. Returns '' if
+  // this teacher name doesn't have a code yet (shouldn't normally happen
+  // for anything already saved, since ensureTeacherCode runs at save time).
+  function getTeacherCodeSync(name){
+    const key = normalizeTeacherKey(name);
+    if (!key) return '';
+    return teacherCodes[key] || '';
+  }
+
+  // Assigns a new short code for a teacher name if one doesn't already
+  // exist, and persists it — a no-op if the name already has a code. This
+  // is the only place a real teacher name and its code ever get linked;
+  // every other part of the app only ever sees the code afterward.
+  async function ensureTeacherCode(name){
+    const key = normalizeTeacherKey(name);
+    if (!key) return '';
+    if (teacherCodes[key]) return teacherCodes[key];
+
+    const MAX_TRIES = 4;
+    for (let attempt = 0; attempt < MAX_TRIES; attempt++) {
+      try {
+        const { data, sha } = await ghGetFile(TEACHER_CODES_PATH);
+        const fresh = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+        if (fresh[key]) { teacherCodes = fresh; return fresh[key]; }
+        const nextNum = Object.keys(fresh).length + 1;
+        const code = '-X' + nextNum;
+        fresh[key] = code;
+        await ghPutFile(TEACHER_CODES_PATH, fresh, sha, 'Assign a PES code for a new teacher name');
+        teacherCodes = fresh;
+        return code;
+      } catch (e) {
+        if (e && (e.status === 409 || e.status === 422)) continue; // someone else wrote first — retry
+        console.error('Could not assign a PES code', e);
+        return '';
+      }
+    }
+    console.error('Could not assign a PES code after retries');
+    return '';
   }
 
   async function mutateQueue(mutatorFn, message){
@@ -1378,13 +1452,15 @@
     // Split into separate words so "Maya C 4" matches a student named Maya
     // with last initial C in grade 4, regardless of what order they're typed
     // in — a single combined substring check would miss anything but an
-    // exact "name then grade" phrase.
+    // exact "name then grade" phrase. The real teacher name is searchable
+    // here too (any fragment of it), even though it's never shown as-is —
+    // only its PES code ever gets displayed.
     const tokens = raw.toLowerCase().split(/\s+/).filter(Boolean);
     const matches = records.filter(r => {
       return (Array.isArray(r.students) ? r.students : []).some(s => {
         const f = studentFields(s);
         const grade = f.grade || r.grade || '';
-        const haystack = `${studentDisplayName(s)} ${grade}`.toLowerCase();
+        const haystack = `${studentDisplayName(s)} ${grade} ${f.teacher || ''}`.toLowerCase();
         return tokens.every(t => haystack.includes(t));
       });
     });
@@ -2023,6 +2099,12 @@
       }
     }
 
+    // Assign a PES code for any teacher name that doesn't have one yet —
+    // this is the only moment a real teacher name and its code get linked.
+    for (const s of students) {
+      if (s.teacher) await ensureTeacherCode(s.teacher);
+    }
+
     const change = { editId, students, contactName, tagCode, notes };
     applyRecordChange(records, change); // optimistic — instant screen update
     clearForm();
@@ -2080,6 +2162,7 @@
       lastName: header.indexOf('lastname'),
       firstName: header.indexOf('firstname'),
       grade: header.indexOf('grade'),
+      teacher: header.findIndex(h => h === 'teacher' || h === 'teachername' || h === 'pes'),
       contactName: header.indexOf('contactname'),
       notes: header.indexOf('notes')
     };
@@ -2105,6 +2188,7 @@
         lastName,
         studentId: idx.studentId > -1 ? (cols[idx.studentId] || '') : '',
         grade: idx.grade > -1 ? (cols[idx.grade] || '') : '',
+        teacher: idx.teacher > -1 ? (cols[idx.teacher] || '') : '',
         contactName,
         notes: idx.notes > -1 ? (cols[idx.notes] || '') : ''
       };
@@ -2150,7 +2234,7 @@
     const groups = {};
     pendingCsvRows.forEach(r => {
       groups[r.groupKey] = groups[r.groupKey] || { familyCode: r.familyCode, students: [], contactName: r.contactName, notes: r.notes };
-      groups[r.groupKey].students.push({ firstName: r.firstName, lastName: r.lastName, studentId: r.studentId, grade: r.grade });
+      groups[r.groupKey].students.push({ firstName: r.firstName, lastName: r.lastName, studentId: r.studentId, grade: r.grade, teacher: r.teacher });
     });
 
     // Warn before creating brand-new cars if a student in this file looks like
@@ -2175,6 +2259,12 @@
       const more = collisions.length > 8 ? `\n…and ${collisions.length - 8} more` : '';
       if (!confirm(`Heads up — ${collisions.length} student(s) in this file look like they might already be on the roster:\n\n${preview}${more}\n\nImport anyway? (Tip: use "Match & fill" instead if you're trying to avoid duplicates.)`)) return;
     }
+
+    // Assign a PES code for every distinct teacher name in this file that
+    // doesn't have one yet, before the roster write itself.
+    const teacherNames = new Set();
+    Object.values(groups).forEach(g => g.students.forEach(s => { if (s.teacher) teacherNames.add(s.teacher); }));
+    for (const name of teacherNames) await ensureTeacherCode(name);
 
     function applyCsvImport(list){
       Object.values(groups).forEach(g => {
@@ -2436,10 +2526,10 @@
   }
 
   function rowsToCsv(rows){
-    const header = ['Family Code', 'Student ID', 'Last Name', 'First Name', 'Grade', 'Contact Name', 'Notes'];
+    const header = ['Family Code', 'Student ID', 'Last Name', 'First Name', 'Grade', 'Teacher', 'Contact Name', 'Notes'];
     const lines = [header.join(',')];
     rows.forEach(r => {
-      lines.push([r.familyCode, r.studentId, r.lastName, r.firstName, r.grade, r.contactName, r.notes].map(csvField).join(','));
+      lines.push([r.familyCode, r.studentId, r.lastName, r.firstName, r.grade, r.teacher, r.contactName, r.notes].map(csvField).join(','));
     });
     return lines.join('\r\n');
   }
@@ -2464,6 +2554,7 @@
           lastName: f.lastName || '',
           firstName: f.firstName || '',
           grade: f.grade || r.grade || '',
+          teacher: f.teacher || '',
           contactName: r.contactName || '',
           notes: r.notes || ''
         });
@@ -2869,6 +2960,7 @@
     $('#settingsMsg').innerHTML = `<div class="banner info">Saved. Connecting…</div>`;
     await loadFromGithub();
     await loadQueueFromGithub();
+    await loadTeacherCodesFromGithub();
     $('#settingsMsg').innerHTML = `<div class="banner info">Connected to ${owner}/${repo} (${branch}).</div>`;
   });
 
@@ -3114,7 +3206,7 @@
     $('#printSinceInput').value = localStr;
   })();
 
-  if (settings) { loadFromGithub(); loadQueueFromGithub(); }
+  if (settings) { loadFromGithub(); loadQueueFromGithub(); loadTeacherCodesFromGithub(); }
   // periodic refresh so multiple phones stay in sync — queue is time-sensitive during dismissal
   setInterval(() => { if (settings) loadFromGithub(false); }, 30000);
   setInterval(() => { if (settings) loadQueueFromGithub(false); }, 12000);
