@@ -771,6 +771,15 @@
     <div class="row-2" style="margin-bottom:10px;">
       <button class="btn-small" id="logLast7Btn">📅 Last 7 days</button>
     </div>
+    <div class="row-2" style="margin-bottom:10px;">
+      <select id="logGradeFilter" title="Show only cars with at least one student in this grade (siblings in other grades still show, since they rode in the same car)">
+        <option value="">All grades</option>
+      </select>
+      <select id="logSortSelect">
+        <option value="default">Sort: time / name</option>
+        <option value="grade">Sort: by grade</option>
+      </select>
+    </div>
     <p class="hint" id="logSummary">Loading…</p>
     <div id="logDayCounts"></div>
     <div id="logList"></div>
@@ -3192,6 +3201,71 @@
     return days;
   }
 
+  // ---- Grade filtering/sorting for the log viewer ----
+  // Grades are stored as free text ("TK", "K", "3", "5th"), so sorting needs
+  // its own ordering rather than plain alphabetical (which would put "10"
+  // before "2" and "K" somewhere random).
+  function normGradeLabel(g){
+    return String(g || '').trim().toLowerCase();
+  }
+
+  function gradeSortKey(g){
+    const s = normGradeLabel(g);
+    if (!s) return 999;
+    if (s === 'tk' || s.startsWith('pre')) return -2;
+    if (s === 'k' || s.startsWith('kind')) return -1;
+    const n = parseInt(s, 10);
+    if (Number.isFinite(n)) return n;
+    return 500;
+  }
+
+  // A car is shown when ANY student in it matches the chosen grade — and the
+  // whole car is shown, so siblings in other grades who rode along still
+  // appear. That's the "5th graders and their siblings" view.
+  function entryHasGrade(entry, gradeNorm){
+    return (entry.students || []).some(s => normGradeLabel(s.grade) === gradeNorm);
+  }
+
+  function entryLowestGradeKey(entry){
+    const keys = (entry.students || []).map(s => gradeSortKey(s.grade));
+    return keys.length ? Math.min(...keys) : 999;
+  }
+
+  function applyLogGradeAndSort(entries){
+    const gradeNorm = $('#logGradeFilter').value;
+    const sortMode = $('#logSortSelect').value;
+    let out = entries.slice();
+    if (gradeNorm) out = out.filter(e => entryHasGrade(e, gradeNorm));
+    if (sortMode === 'grade') {
+      out.sort((a, b) => (entryLowestGradeKey(a) - entryLowestGradeKey(b)) || (a.pickedUpAt - b.pickedUpAt));
+    }
+    return out;
+  }
+
+  // Entries for whatever the viewer is currently showing (day or 7-day
+  // range), with the grade filter and sort applied — one source of truth
+  // so the screen and both CSV exports can never disagree.
+  function currentLogEntries(){
+    const base = logViewMode === 'day'
+      ? entriesForDate(cachedLog, $('#logDateInput').value)
+      : entriesInRange(cachedLog, logRangeStart, logRangeEnd);
+    return applyLogGradeAndSort(base);
+  }
+
+  function populateLogGradeFilter(){
+    const sel = $('#logGradeFilter');
+    const keep = sel.value;
+    const seen = new Map(); // normalized -> display label (first seen casing)
+    (cachedLog || []).forEach(e => (e.students || []).forEach(s => {
+      const n = normGradeLabel(s.grade);
+      if (n && !seen.has(n)) seen.set(n, String(s.grade).trim());
+    }));
+    const opts = Array.from(seen.entries()).sort((a, b) => gradeSortKey(a[0]) - gradeSortKey(b[0]) || a[0].localeCompare(b[0]));
+    sel.innerHTML = '<option value="">All grades</option>' +
+      opts.map(([n, label]) => `<option value="${escapeHtml(n)}">Grade ${escapeHtml(label)} (and siblings)</option>`).join('');
+    sel.value = seen.has(keep) ? keep : '';
+  }
+
   // Dedupes by student name+grade — the log only ever stores a name and
   // grade snapshot, not a stable student ID, so that's the best key
   // available. Good enough for "who has actually shown up in car line" —
@@ -3207,18 +3281,24 @@
         if (e.pickedUpAt > rec.lastPickedUpAt) { rec.lastPickedUpAt = e.pickedUpAt; rec.lastTagCode = e.tagCode || ''; }
       });
     });
-    return Array.from(map.values()).sort((a,b) => a.name.localeCompare(b.name));
+    const byGrade = $('#logSortSelect').value === 'grade';
+    return Array.from(map.values()).sort((a,b) =>
+      byGrade ? ((gradeSortKey(a.grade) - gradeSortKey(b.grade)) || a.name.localeCompare(b.name)) : a.name.localeCompare(b.name)
+    );
   }
 
   function renderLog(){
+    const gradeNorm = $('#logGradeFilter').value;
+    const gradeLabel = gradeNorm ? ` — grade ${$('#logGradeFilter').selectedOptions[0].textContent.replace(/^Grade | \(and siblings\)$/g, '')} and siblings` : '';
+    const entries = currentLogEntries();
+
     if (logViewMode === 'day') {
       const dateStr = $('#logDateInput').value;
-      const dayEntries = entriesForDate(cachedLog, dateStr);
-      $('#logSummary').textContent = dayEntries.length
-        ? `${dayEntries.length} pickup${dayEntries.length===1?'':'s'} on ${dateStr}.`
-        : `No pickups logged for ${dateStr || 'that day'}.`;
+      $('#logSummary').textContent = entries.length
+        ? `${entries.length} pickup${entries.length===1?'':'s'} on ${dateStr}${gradeLabel}.`
+        : `No pickups logged for ${dateStr || 'that day'}${gradeLabel}.`;
       $('#logDayCounts').innerHTML = '';
-      $('#logList').innerHTML = dayEntries.map(e => `
+      $('#logList').innerHTML = entries.map(e => `
         <div class="history-row">
           <div class="hist-msg">${escapeHtml(logEntryStudentsText(e))}</div>
           <div class="hist-meta">${escapeHtml(e.tagCode || '')} · picked up ${new Date(e.pickedUpAt).toLocaleTimeString()}</div>
@@ -3227,10 +3307,9 @@
       $('#logExportBtn').textContent = '⬇️ Export this view (CSV)';
       $('#logExportUniqueBtn').style.display = 'none';
     } else {
-      const entries = entriesInRange(cachedLog, logRangeStart, logRangeEnd);
       const counts = perDayCounts(entries);
       const uniques = uniqueStudentsInRange(entries);
-      $('#logSummary').textContent = `${entries.length} pickup${entries.length===1?'':'s'} across ${uniques.length} unique student${uniques.length===1?'':'s'}, ${logRangeStart} to ${logRangeEnd}.`;
+      $('#logSummary').textContent = `${entries.length} pickup${entries.length===1?'':'s'} across ${uniques.length} unique student${uniques.length===1?'':'s'}, ${logRangeStart} to ${logRangeEnd}${gradeLabel}.`;
       $('#logDayCounts').innerHTML = `
         <div class="hint" style="font-weight:700;margin-top:6px;">Pickups per day (for comparing across the week):</div>
         ${allDaysInRange(logRangeStart, logRangeEnd).map(d => `
@@ -3264,6 +3343,7 @@
     try {
       const { data } = await ghGetFile(LOG_PATH);
       cachedLog = Array.isArray(data) ? data : [];
+      populateLogGradeFilter();
       renderLog();
     } catch (e) {
       console.error(e);
@@ -3284,6 +3364,8 @@
     $('#logDateInput').value = localDateInputValue(new Date());
     renderLog();
   });
+  $('#logGradeFilter').addEventListener('change', renderLog);
+  $('#logSortSelect').addEventListener('change', renderLog);
   $('#logLast7Btn').addEventListener('click', () => {
     logViewMode = 'range';
     const end = new Date();
@@ -3295,9 +3377,10 @@
   });
 
   $('#logExportBtn').addEventListener('click', () => {
-    const entries = logViewMode === 'day' ? entriesForDate(cachedLog, $('#logDateInput').value) : entriesInRange(cachedLog, logRangeStart, logRangeEnd);
-    const filenameSuffix = logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`;
-    if (!entries.length) { alert('Nothing logged for that range — nothing to export.'); return; }
+    const entries = currentLogEntries();
+    const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
+    const filenameSuffix = (logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`) + gradeTag;
+    if (!entries.length) { alert('Nothing logged for that view — nothing to export.'); return; }
     const rows = [['Date', 'Tag Code', 'Students', 'Added to queue', 'Picked up']];
     entries.forEach(e => {
       rows.push([
@@ -3313,7 +3396,7 @@
   });
 
   $('#logExportUniqueBtn').addEventListener('click', () => {
-    const entries = entriesInRange(cachedLog, logRangeStart, logRangeEnd);
+    const entries = currentLogEntries();
     const uniques = uniqueStudentsInRange(entries);
     if (!uniques.length) { alert('Nothing to export for that range.'); return; }
     const rows = [['Student', 'Grade', 'Times Picked Up', 'Most Recent Pickup Date', 'Most Recent Car Code']];
@@ -3321,7 +3404,8 @@
       rows.push([u.name, u.grade, u.count, localDateInputValue(new Date(u.lastPickedUpAt)), u.lastTagCode]);
     });
     const csv = rows.map(r => r.map(csvField).join(',')).join('\r\n');
-    downloadCsv(`pickup-log-unique-students-${logRangeStart}_to_${logRangeEnd}.csv`, csv);
+    const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
+    downloadCsv(`pickup-log-unique-students-${logRangeStart}_to_${logRangeEnd}${gradeTag}.csv`, csv);
   });
 
   $('#logClearAllBtn').addEventListener('click', async () => {
