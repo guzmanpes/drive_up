@@ -770,6 +770,7 @@
     </div>
     <div class="row-2" style="margin-bottom:10px;">
       <button class="btn-small" id="logLast7Btn">📅 Last 7 days</button>
+      <button class="btn-small" id="logAllTimeBtn">♾️ All time</button>
     </div>
     <div class="row-2" style="margin-bottom:10px;">
       <select id="logGradeFilter" title="Show only cars with at least one student in this grade (siblings in other grades still show, since they rode in the same car)">
@@ -3140,6 +3141,7 @@
   let logViewMode = 'day'; // 'day' | 'range'
   let logRangeStart = null;
   let logRangeEnd = null;
+  let logRangeAllTime = false; // all-time view lists only days that actually had pickups
 
   function localDateInputValue(d){
     const yyyy = d.getFullYear(), mm = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
@@ -3191,6 +3193,12 @@
       counts[d] = (counts[d] || 0) + 1;
     });
     return counts;
+  }
+
+  function earliestLogDate(log){
+    let min = null;
+    (log || []).forEach(e => { if (e.pickedUpAt && (min === null || e.pickedUpAt < min)) min = e.pickedUpAt; });
+    return min === null ? null : localDateInputValue(new Date(min));
   }
 
   function allDaysInRange(startStr, endStr){
@@ -3309,10 +3317,19 @@
     } else {
       const counts = perDayCounts(entries);
       const uniques = uniqueStudentsInRange(entries);
-      $('#logSummary').textContent = `${entries.length} pickup${entries.length===1?'':'s'} across ${uniques.length} unique student${uniques.length===1?'':'s'}, ${logRangeStart} to ${logRangeEnd}${gradeLabel}.`;
+      // All-time spans months, so only list days that actually had pickups
+      // (newest first) instead of every calendar day including weekends.
+      const dayList = logRangeAllTime
+        ? Object.keys(counts).sort().reverse()
+        : allDaysInRange(logRangeStart, logRangeEnd);
+      const activeDays = Object.keys(counts).length;
+      const avg = activeDays ? (entries.length / activeDays).toFixed(1) : '0';
+      $('#logSummary').textContent = logRangeAllTime
+        ? `All time: ${entries.length} pickup${entries.length===1?'':'s'} across ${uniques.length} unique student${uniques.length===1?'':'s'} over ${activeDays} day${activeDays===1?'':'s'} with pickups (avg ${avg} per day), ${logRangeStart} to ${logRangeEnd}${gradeLabel}.`
+        : `${entries.length} pickup${entries.length===1?'':'s'} across ${uniques.length} unique student${uniques.length===1?'':'s'}, ${logRangeStart} to ${logRangeEnd}${gradeLabel}.`;
       $('#logDayCounts').innerHTML = `
-        <div class="hint" style="font-weight:700;margin-top:6px;">Pickups per day (for comparing across the week):</div>
-        ${allDaysInRange(logRangeStart, logRangeEnd).map(d => `
+        <div class="hint" style="font-weight:700;margin-top:6px;">${logRangeAllTime ? 'Pickups per day (days with at least one pickup, newest first):' : 'Pickups per day (for comparing across the week):'}</div>
+        ${dayList.map(d => `
           <div class="history-row" style="display:flex;justify-content:space-between;align-items:center;">
             <span>${d}</span><span><strong>${counts[d] || 0}</strong></span>
           </div>
@@ -3371,8 +3388,18 @@
     const end = new Date();
     const start = new Date();
     start.setDate(start.getDate() - 6); // inclusive: today + 6 prior days = 7 days total
+    logRangeAllTime = false;
     logRangeStart = localDateInputValue(start);
     logRangeEnd = localDateInputValue(end);
+    renderLog();
+  });
+  $('#logAllTimeBtn').addEventListener('click', () => {
+    const first = earliestLogDate(cachedLog);
+    if (!first) { alert('Nothing in the pickup log yet.'); return; }
+    logViewMode = 'range';
+    logRangeAllTime = true;
+    logRangeStart = first;
+    logRangeEnd = localDateInputValue(new Date());
     renderLog();
   });
 
