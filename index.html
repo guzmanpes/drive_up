@@ -465,6 +465,19 @@
     border-radius:10px;padding:11px;font-weight:700;font-size:14px;cursor:pointer;
   }
   .camera-sheet{max-width:640px;}
+  .scan-review{background:#fff;border:2px solid var(--vest);border-radius:12px;padding:12px;margin-bottom:10px;}
+  .scan-review .btn{margin-top:8px;}
+  .scan-review-code{font-family:'Barlow Condensed',sans-serif;font-weight:700;letter-spacing:1px;font-size:18px;margin-bottom:6px;}
+  .scan-review-toggle{display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;cursor:pointer;}
+  .scan-review-toggle input{width:18px;height:18px;flex-shrink:0;}
+  .scan-rider-remove{background:none;border:none;color:var(--bad);font-weight:700;font-size:14px;cursor:pointer;padding:0 4px;}
+  /* While reviewing, shrink the camera away (not display:none — some phones
+     pause a hidden video) so the family check gets the whole screen. */
+  .camera-sheet.reviewing .camera-frame{aspect-ratio:auto;height:0;margin:0;overflow:hidden;}
+  .camera-sheet.reviewing #cameraHint,
+  .camera-sheet.reviewing #cameraStatus,
+  .camera-sheet.reviewing .scan-review-toggle,
+  .camera-sheet.reviewing #scanToast{display:none;}
   .camera-frame{
     position:relative;background:#000;border-radius:12px;overflow:hidden;
     aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;
@@ -688,12 +701,23 @@
     <div class="sheet-handle"></div>
     <button class="sheet-close" id="closeCameraBtn">✕</button>
     <h3 style="font-family:'Barlow Condensed',sans-serif;text-transform:uppercase;letter-spacing:0.4px;margin:0 0 10px;">Scan car tag</h3>
+    <div class="scan-review" id="scanReview" style="display:none;">
+      <div class="scan-review-code" id="scanReviewCode"></div>
+      <div id="scanReviewBanner"></div>
+      <div id="scanReviewList"></div>
+      <div class="hint">Uncheck anyone who isn't in the car today. Tap Add rider if someone extra is riding along.</div>
+      <div id="scanReviewRiders"></div>
+      <button class="btn btn-secondary" id="scanReviewAddRiderBtn">➕ Add rider</button>
+      <button class="btn btn-primary" id="scanReviewConfirmBtn">✓ Add to queue</button>
+      <button class="btn btn-ghost" id="scanReviewCancelBtn">Cancel — scan next car</button>
+    </div>
     <div class="camera-frame">
       <video id="cameraVideo" playsinline autoplay muted></video>
       <div class="camera-guide"></div>
     </div>
     <canvas id="cameraCanvas" style="display:none;"></canvas>
-    <p class="hint" id="cameraHint">Hold the printed tag inside the box. It adds to the queue automatically the moment it's recognized — keep scanning the next car right after.</p>
+    <p class="hint" id="cameraHint"></p>
+    <label class="scan-review-toggle"><input type="checkbox" id="scanReviewToggle"> Review each scan before adding</label>
     <div id="cameraStatus">Point the camera at a tag…</div>
     <div class="scan-toast" id="scanToast"></div>
     <div class="row-2" style="margin-top:12px;">
@@ -1279,7 +1303,7 @@
       const mappedStudents = studentsToUse.map(s => ({
         name: studentDisplayName(s),
         grade: studentFields(s).grade || record.grade || ''
-      }));
+      })).concat(((opts && opts.extraRiders) || []).map(r => ({ ...r })));
 
       // "Add after queue" — a second person adding from further down the
       // line who wants to skip the reserve-a-spot step and just be placed
@@ -1900,17 +1924,18 @@
     return results;
   }
 
-  async function addRiderToQueueEntry(queueId){
-    const entry = queue.find(q => q.id === queueId);
-    if (!entry) return;
-
+  // Shared by "Add rider" on a queue entry and the scan-review panel:
+  // search the whole roster, disambiguate, confirm — returns the rider
+  // object to attach, or null if cancelled / not found. Never touches
+  // either car's roster record.
+  function pickRiderStudent(){
     const query = prompt('Add a rider who isn\'t normally in this car — type their name (add a grade too, like "Maya 4", if there are multiple students with that name):');
-    if (query === null || !query.trim()) return;
+    if (query === null || !query.trim()) return null;
 
     const matches = findStudentsByQuery(query.trim());
     if (matches.length === 0) {
       alert('No student found with that name. Check the spelling, or try adding their grade to narrow it down.');
-      return;
+      return null;
     }
     let chosen;
     if (matches.length === 1) {
@@ -1919,23 +1944,27 @@
       const list = matches.slice(0, 10).map((m, i) => `${i + 1}. ${studentDisplayName(m.student)}${m.grade ? ' (' + m.grade + ')' : ''} — code ${m.record.tagCode || 'none'}`).join('\n');
       const pick = prompt(`Multiple students matched — type the number of the correct one:\n\n${list}`);
       const idx = parseInt(pick, 10) - 1;
-      if (!Number.isFinite(idx) || idx < 0 || idx >= matches.length) { return; }
+      if (!Number.isFinite(idx) || idx < 0 || idx >= matches.length) return null;
       chosen = matches[idx];
     }
 
     const displayName = studentDisplayName(chosen.student);
-    if (!confirm(`Add ${displayName}${chosen.grade ? ' (' + chosen.grade + ')' : ''} — normally on car ${chosen.record.tagCode || '(no code)'} — as an extra rider on THIS car today?\n\nThis only affects today's queue. Their roster record isn't changed.`)) return;
+    if (!confirm(`Add ${displayName}${chosen.grade ? ' (' + chosen.grade + ')' : ''} — normally on car ${chosen.record.tagCode || '(no code)'} — as an extra rider on THIS car today?\n\nThis only affects today's queue. Their roster record isn't changed.`)) return null;
+
+    return { name: displayName, grade: chosen.grade || '', isRider: true, riderFromTagCode: chosen.record.tagCode || '' };
+  }
+
+  async function addRiderToQueueEntry(queueId){
+    const entry = queue.find(q => q.id === queueId);
+    if (!entry) return;
+    const rider = pickRiderStudent();
+    if (!rider) return;
 
     await mutateQueue(current => {
       const e = current.find(q => q.id === queueId);
       if (!e) return current;
       if (!Array.isArray(e.students)) e.students = [];
-      e.students.push({
-        name: displayName,
-        grade: chosen.grade || '',
-        isRider: true,
-        riderFromTagCode: chosen.record.tagCode || ''
-      });
+      e.students.push({ ...rider });
       return current;
     }, 'Add a temporary rider to today\'s queue entry');
   }
@@ -2822,6 +2851,102 @@
   const video = $('#cameraVideo');
   const canvas = $('#cameraCanvas');
 
+  // Review step: after a scan, pause and show who's in the car so a missing
+  // rider / absent sibling can be fixed BEFORE it goes in the queue (the
+  // checkboxes, midday default, and Add rider were added after the original
+  // scan-straight-to-queue behavior). Can be switched off for instant-add.
+  const SCAN_REVIEW_KEY = 'carline_scan_review_v1';
+  let scanReviewMode = localStorage.getItem(SCAN_REVIEW_KEY) !== 'off'; // default ON
+  let scanReviewActive = false;
+  let scanPending = null; // { record, riders: [] }
+
+  function updateCameraHint(){
+    $('#cameraHint').textContent = scanReviewMode
+      ? 'Hold the printed tag inside the box. After each scan you\'ll see the family so you can check who\'s riding before it\'s added — then it goes right back to scanning.'
+      : 'Hold the printed tag inside the box. It adds to the queue automatically the moment it\'s recognized — keep scanning the next car right after.';
+    $('#scanReviewToggle').checked = scanReviewMode;
+  }
+
+  function resetScanReviewState(){
+    scanReviewActive = false;
+    scanPending = null;
+    const sheet = document.querySelector('#cameraOverlay .camera-sheet');
+    if (sheet) sheet.classList.remove('reviewing');
+    $('#scanReview').style.display = 'none';
+  }
+
+  function renderScanRiders(){
+    $('#scanReviewRiders').innerHTML = (scanPending ? scanPending.riders : []).map((r, i) => `
+      <div class="student-check-line">
+        <strong>${escapeHtml(r.name)}</strong>${r.grade ? ` <span class="meta">· ${escapeHtml(r.grade)}</span>` : ''}
+        <span class="q-rider-tag" title="Normally on car ${escapeHtml(r.riderFromTagCode || '')}">🚗 rider</span>
+        <button type="button" class="scan-rider-remove" data-rider-idx="${i}" title="Remove this rider">✕</button>
+      </div>`).join('');
+  }
+
+  function openScanReview(record){
+    scanPending = { record, riders: [] };
+    scanReviewActive = true;
+    document.querySelector('#cameraOverlay .camera-sheet').classList.add('reviewing');
+    $('#scanReview').style.display = 'block';
+    $('#scanReviewCode').textContent = 'Family ' + (record.tagCode || '');
+    $('#scanReviewBanner').innerHTML = todaysPickedUpTagCodes.has(record.tagCode)
+      ? '<div class="hint" style="font-weight:700;color:var(--good);">✅ Already picked up today — adding again means a second pickup.</div>' : '';
+    $('#scanReviewList').innerHTML = (record.students || []).map((s, idx) => studentCheckLineHtml(s, idx, record.grade)).join('');
+    $('#scanReviewConfirmBtn').disabled = false;
+    renderScanRiders();
+  }
+
+  // Back to scanning. The short cooldown stops a tag still held in front of
+  // the camera from instantly reopening the panel it was just dismissed from.
+  function endScanReview(){
+    resetScanReviewState();
+    lastScanTime = Date.now() + 2500;
+    if (video && video.play) { try { video.play().catch(() => {}); } catch (e) {} }
+  }
+
+  async function confirmScanReview(){
+    if (!scanPending) return;
+    const { record, riders } = scanPending;
+    const boxes = Array.from(document.querySelectorAll('#scanReviewList .lookup-student-check'));
+    const checkedIdx = boxes.filter(b => b.checked).map(b => Number(b.dataset.studentIdx));
+    if (!checkedIdx.length) { alert('Check at least one student before adding this car to the queue.'); return; }
+    const present = (record.students || []).filter((_, i) => checkedIdx.includes(i));
+    const names = present.map(st => studentDisplayName(st)).concat(riders.map(r => r.name)).join(', ');
+
+    $('#scanReviewConfirmBtn').disabled = true;
+    const ok = await addToQueue(record, present, { extraRiders: riders });
+    if (!ok) { $('#scanReviewConfirmBtn').disabled = false; return; } // mutateQueue already said why — stay here to retry
+    endScanReview();
+    const toast = $('#scanToast');
+    toast.className = 'scan-toast show';
+    toast.textContent = `✅ Added ${names} to the queue.`;
+  }
+
+  $('#scanReviewConfirmBtn').addEventListener('click', confirmScanReview);
+  $('#scanReviewCancelBtn').addEventListener('click', () => {
+    endScanReview();
+    const toast = $('#scanToast');
+    toast.className = 'scan-toast show miss';
+    toast.textContent = 'Cancelled — nothing was added.';
+  });
+  $('#scanReviewAddRiderBtn').addEventListener('click', () => {
+    if (!scanPending) return;
+    const rider = pickRiderStudent();
+    if (rider) { scanPending.riders.push(rider); renderScanRiders(); }
+  });
+  $('#scanReviewRiders').addEventListener('click', (e) => {
+    const idx = e.target.dataset.riderIdx;
+    if (idx === undefined || !scanPending) return;
+    scanPending.riders.splice(Number(idx), 1);
+    renderScanRiders();
+  });
+  $('#scanReviewToggle').addEventListener('change', (e) => {
+    scanReviewMode = e.target.checked;
+    localStorage.setItem(SCAN_REVIEW_KEY, scanReviewMode ? 'on' : 'off');
+    updateCameraHint();
+  });
+
   async function openCamera(){
     resetCameraUI();
     $('#cameraOverlay').classList.add('active');
@@ -2855,11 +2980,14 @@
 
   function closeCamera(){
     scanLoopActive = false;
+    resetScanReviewState();
     stopCameraStream();
     $('#cameraOverlay').classList.remove('active');
   }
 
   function resetCameraUI(){
+    resetScanReviewState();
+    updateCameraHint();
     video.style.display = 'block';
     $('#cameraStatus').className = '';
     $('#cameraStatus').textContent = 'Point the camera at a tag…';
@@ -2871,7 +2999,7 @@
 
   function scanFrame(){
     if (!scanLoopActive) return;
-    if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
+    if (!scanReviewActive && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
@@ -2884,6 +3012,7 @@
   }
 
   function handleScannedCode(text){
+    if (scanReviewActive) return; // paused while someone is reviewing a family
     const now = Date.now();
     if (text === lastScanCode && (now - lastScanTime) < 2500) return; // ignore the same tag held in view
     lastScanCode = text; lastScanTime = now;
@@ -2895,11 +3024,21 @@
       toast.textContent = `Tag not recognized — it isn't on the roster.`;
       return;
     }
-    const already = queue.some(q => q.recordId === record.id);
     const names = record.students.map(s => studentDisplayName(s)).join(', ');
-    addToQueue(record); // no-op if already waiting
-    toast.className = 'scan-toast show' + (already ? ' dupe' : '');
-    toast.textContent = already ? `${names} is already in the queue.` : `✅ Added ${names} to the queue.`;
+    if (queue.some(q => q.recordId === record.id)) {
+      toast.className = 'scan-toast show dupe';
+      toast.textContent = `${names} is already in the queue.`;
+      return;
+    }
+    if (scanReviewMode) {
+      toast.className = 'scan-toast';
+      toast.textContent = '';
+      openScanReview(record);
+      return;
+    }
+    addToQueue(record);
+    toast.className = 'scan-toast show';
+    toast.textContent = `✅ Added ${names} to the queue.`;
   }
 
   $('#openCameraBtn').addEventListener('click', openCamera);
