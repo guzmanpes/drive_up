@@ -465,6 +465,10 @@
     border-radius:10px;padding:11px;font-weight:700;font-size:14px;cursor:pointer;
   }
   .camera-sheet{max-width:640px;}
+  .print-alert{
+    background:#FCEFCF;border:1px solid #EAD48F;color:#5C4400;border-radius:10px;
+    padding:10px 12px;margin:8px 0;font-size:13.5px;display:flex;flex-direction:column;gap:8px;align-items:flex-start;
+  }
   .scan-review{background:#fff;border:2px solid var(--vest);border-radius:12px;padding:12px;margin-bottom:10px;}
   .scan-review .btn{margin-top:8px;}
   .scan-review-code{font-family:'Barlow Condensed',sans-serif;font-weight:700;letter-spacing:1px;font-size:18px;margin-bottom:6px;}
@@ -805,7 +809,9 @@
         <option value="grade">Sort: by grade</option>
       </select>
     </div>
+    <label class="scan-review-toggle" style="margin:0 0 8px;"><input type="checkbox" id="logUnprintedOnly"> Only show families whose tag isn't printed yet</label>
     <p class="hint" id="logSummary">Loading…</p>
+    <div id="logPrintAlert"></div>
     <div id="logDayCounts"></div>
     <div id="logList"></div>
     <div class="row-2" style="margin-top:12px;">
@@ -3392,11 +3398,54 @@
   // Entries for whatever the viewer is currently showing (day or 7-day
   // range), with the grade filter and sort applied — one source of truth
   // so the screen and both CSV exports can never disagree.
-  function currentLogEntries(){
+  // Which roster families have never had a tag printed (per the Print
+  // buttons' own record — see tagPrintedAt). Families not on the roster
+  // (walk-ups, deleted cars) have no tag to print, so they're never flagged.
+  function unprintedTagCodeSet(){
+    return new Set((records || []).filter(r => r.tagCode && !r.tagPrintedAt).map(r => r.tagCode));
+  }
+
+  // 'Yes' / 'No' / '' (not on the roster) — for the CSV exports.
+  function makePrintedStatusFn(){
+    const unprinted = unprintedTagCodeSet();
+    const onRoster = new Set((records || []).map(r => r.tagCode).filter(Boolean));
+    return code => !code ? '' : (unprinted.has(code) ? 'No' : (onRoster.has(code) ? 'Yes' : ''));
+  }
+
+  // Entries for the current day/range with grade filter + sort applied,
+  // BEFORE the "only unprinted" filter — the banner counts from this set so
+  // it can still say how many are flagged while the filter is on.
+  function gradeSortedLogEntries(){
     const base = logViewMode === 'day'
       ? entriesForDate(cachedLog, $('#logDateInput').value)
       : entriesInRange(cachedLog, logRangeStart, logRangeEnd);
     return applyLogGradeAndSort(base);
+  }
+
+  function unprintedCodesInView(){
+    const unprinted = unprintedTagCodeSet();
+    return new Set(gradeSortedLogEntries().filter(e => unprinted.has(e.tagCode)).map(e => e.tagCode));
+  }
+
+  function currentLogEntries(){
+    const out = gradeSortedLogEntries();
+    if (!$('#logUnprintedOnly').checked) return out;
+    const unprinted = unprintedTagCodeSet();
+    return out.filter(e => unprinted.has(e.tagCode));
+  }
+
+  function renderPrintAlert(entryCount, unprintedFamilies){
+    const box = $('#logPrintAlert');
+    const n = unprintedFamilies.size;
+    if (!entryCount && !n) { box.innerHTML = ''; return; }
+    if (!n) {
+      box.innerHTML = '<div class="hint" style="font-weight:700;color:var(--good);">✅ Every roster family in this view has a printed tag.</div>';
+      return;
+    }
+    box.innerHTML = `<div class="print-alert">
+      <span>⚠️ <strong>${n} famil${n===1?'y':'ies'}</strong> picked up in this view ${n===1?'has':'have'} no printed tag yet.${$('#logUnprintedOnly').checked ? ' (Showing only those.)' : ''}</span>
+      <button class="btn-small" id="logPrintUnprintedBtn" type="button">🖨️ Print ${n === 1 ? 'this tag' : 'these ' + n + ' tags'}</button>
+    </div>`;
   }
 
   function populateLogGradeFilter(){
@@ -3423,6 +3472,7 @@
   function uniqueFamiliesInRange(entries){
     const rosterByCode = new Map();
     (records || []).forEach(r => { if (r.tagCode) rosterByCode.set(r.tagCode, r); });
+    const unprintedSet = unprintedTagCodeSet();
     const map = new Map();
     entries.forEach(e => {
       const code = e.tagCode || '';
@@ -3439,7 +3489,7 @@
       const children = onRoster
         ? rec.students.map(st => ({ name: studentDisplayName(st), grade: studentFields(st).grade || rec.grade || '' }))
         : Array.from(f.seen.values());
-      return { tagCode: f.tagCode, onRoster, children, count: f.count, lastPickedUpAt: f.lastPickedUpAt };
+      return { tagCode: f.tagCode, onRoster, tagUnprinted: unprintedSet.has(f.tagCode), children, count: f.count, lastPickedUpAt: f.lastPickedUpAt };
     });
     const byGrade = $('#logSortSelect').value === 'grade';
     const lowKey = fam => Math.min(...fam.children.map(c => gradeSortKey(c.grade)), 999);
@@ -3457,6 +3507,9 @@
     const gradeNorm = $('#logGradeFilter').value;
     const gradeLabel = gradeNorm ? ` — grade ${$('#logGradeFilter').selectedOptions[0].textContent.replace(/^Grade | \(and siblings\)$/g, '')} and siblings` : '';
     const entries = currentLogEntries();
+    const unprintedSet = unprintedTagCodeSet();
+    const NOT_PRINTED_BADGE = ' <span class="print-badge print-badge-never">🖨️ Tag not printed</span>';
+    renderPrintAlert(gradeSortedLogEntries().length, unprintedCodesInView());
 
     if (logViewMode === 'day') {
       const dateStr = $('#logDateInput').value;
@@ -3467,7 +3520,7 @@
       $('#logList').innerHTML = entries.map(e => `
         <div class="history-row">
           <div class="hist-msg">${escapeHtml(logEntryStudentsText(e))}</div>
-          <div class="hist-meta">${escapeHtml(e.tagCode || '')} · picked up ${new Date(e.pickedUpAt).toLocaleTimeString()}</div>
+          <div class="hist-meta">${escapeHtml(e.tagCode || '')} · picked up ${new Date(e.pickedUpAt).toLocaleTimeString()}${unprintedSet.has(e.tagCode) ? NOT_PRINTED_BADGE : ''}</div>
         </div>
       `).join('');
       $('#logExportBtn').textContent = '⬇️ Export this view (CSV)';
@@ -3501,7 +3554,7 @@
         ${fams.map(f => `
           <div class="history-row">
             <div class="hist-msg">${escapeHtml(familyChildrenText(f))}</div>
-            <div class="hist-meta">Family ${f.tagCode ? escapeHtml(f.tagCode) : '(not on file)'}${f.tagCode && !f.onRoster ? ' (no longer on roster)' : ''} · ${f.count} pickup${f.count===1?'':'s'} this range · most recent ${new Date(f.lastPickedUpAt).toLocaleDateString()}</div>
+            <div class="hist-meta">Family ${f.tagCode ? escapeHtml(f.tagCode) : '(not on file)'}${f.tagCode && !f.onRoster ? ' (no longer on roster)' : ''} · ${f.count} pickup${f.count===1?'':'s'} this range · most recent ${new Date(f.lastPickedUpAt).toLocaleDateString()}${f.tagUnprinted ? NOT_PRINTED_BADGE : ''}</div>
           </div>
         `).join('')}
       `;
@@ -3518,6 +3571,8 @@
     $('#logSummary').textContent = 'Loading pickup log…';
     $('#logList').innerHTML = '';
     $('#logDayCounts').innerHTML = '';
+    $('#logPrintAlert').innerHTML = '';
+    $('#logUnprintedOnly').checked = false;
     try {
       const { data } = await ghGetFile(LOG_PATH);
       cachedLog = Array.isArray(data) ? data : [];
@@ -3543,6 +3598,17 @@
     renderLog();
   });
   $('#logGradeFilter').addEventListener('change', renderLog);
+  $('#logUnprintedOnly').addEventListener('change', renderLog);
+  $('#logPrintAlert').addEventListener('click', async (e) => {
+    if (e.target.id !== 'logPrintUnprintedBtn') return;
+    const codes = unprintedCodesInView();
+    const list = records.filter(r => codes.has(r.tagCode));
+    if (!list.length) return;
+    // printTags opens its window straight away, so this must stay directly
+    // inside the tap — no dialogs or awaits before it.
+    await printTags(list);
+    renderLog(); // printing marks them printed, so the banner updates
+  });
   $('#logSortSelect').addEventListener('change', renderLog);
   $('#logLast7Btn').addEventListener('click', () => {
     logViewMode = 'range';
@@ -3567,16 +3633,18 @@
   $('#logExportBtn').addEventListener('click', () => {
     const entries = currentLogEntries();
     const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
-    const filenameSuffix = (logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`) + gradeTag;
+    const filenameSuffix = (logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`) + gradeTag + ($('#logUnprintedOnly').checked ? '-unprinted' : '');
     if (!entries.length) { alert('Nothing logged for that view — nothing to export.'); return; }
-    const rows = [['Date', 'Tag Code', 'Students', 'Added to queue', 'Picked up']];
+    const printedStatus = makePrintedStatusFn();
+    const rows = [['Date', 'Tag Code', 'Students', 'Added to queue', 'Picked up', 'Tag Printed']];
     entries.forEach(e => {
       rows.push([
         localDateInputValue(new Date(e.pickedUpAt)),
         e.tagCode || '',
         logEntryStudentsText(e),
         e.addedAt ? new Date(e.addedAt).toLocaleTimeString() : '',
-        new Date(e.pickedUpAt).toLocaleTimeString()
+        new Date(e.pickedUpAt).toLocaleTimeString(),
+        printedStatus(e.tagCode)
       ]);
     });
     const csv = rows.map(r => r.map(csvField).join(',')).join('\r\n');
@@ -3587,7 +3655,8 @@
     const entries = currentLogEntries();
     const fams = uniqueFamiliesInRange(entries);
     if (!fams.length) { alert('Nothing to export for that range.'); return; }
-    const rows = [['Family Code', 'Students', 'Grades', 'Times Picked Up', 'Most Recent Pickup Date', 'On Roster']];
+    const printedStatus = makePrintedStatusFn();
+    const rows = [['Family Code', 'Students', 'Grades', 'Times Picked Up', 'Most Recent Pickup Date', 'On Roster', 'Tag Printed']];
     fams.forEach(f => {
       rows.push([
         f.tagCode || '',
@@ -3595,12 +3664,13 @@
         f.children.map(c => c.grade).join('; '),
         f.count,
         localDateInputValue(new Date(f.lastPickedUpAt)),
-        f.onRoster ? 'Yes' : 'No'
+        f.onRoster ? 'Yes' : 'No',
+        printedStatus(f.tagCode)
       ]);
     });
     const csv = rows.map(r => r.map(csvField).join(',')).join('\r\n');
     const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
-    downloadCsv(`pickup-log-unique-families-${logRangeStart}_to_${logRangeEnd}${gradeTag}.csv`, csv);
+    downloadCsv(`pickup-log-unique-families-${logRangeStart}_to_${logRangeEnd}${gradeTag}${$('#logUnprintedOnly').checked ? '-unprinted' : ''}.csv`, csv);
   });
 
   $('#logClearAllBtn').addEventListener('click', async () => {
