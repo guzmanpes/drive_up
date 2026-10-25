@@ -465,6 +465,10 @@
     border-radius:10px;padding:11px;font-weight:700;font-size:14px;cursor:pointer;
   }
   .camera-sheet{max-width:640px;}
+  .method-badge{display:inline-block;font-size:11px;font-weight:700;border-radius:6px;padding:2px 7px;margin:3px 3px 3px 0;}
+  .method-qr{background:#E4EFF2;color:var(--teal-dark);}
+  .method-typed{background:#FFF1D6;color:#7A5200;}
+  .method-walkup{background:#EDE7F6;color:#4A3A7A;}
   .print-alert{
     background:#FCEFCF;border:1px solid #EAD48F;color:#5C4400;border-radius:10px;
     padding:10px 12px;margin:8px 0;font-size:13.5px;display:flex;flex-direction:column;gap:8px;align-items:flex-start;
@@ -809,9 +813,15 @@
         <option value="grade">Sort: by grade</option>
       </select>
     </div>
+    <select id="logMethodFilter" style="margin-bottom:8px;" title="Based on how each family's pickups were entered: scanned from their QR tag, or typed in by name">
+      <option value="">All entry methods</option>
+      <option value="typed">Families that only typed in (no QR scan yet)</option>
+      <option value="qr">Families that have used their QR</option>
+    </select>
     <label class="scan-review-toggle" style="margin:0 0 8px;"><input type="checkbox" id="logUnprintedOnly"> Only show families whose tag isn't printed yet</label>
     <p class="hint" id="logSummary">Loading…</p>
     <div id="logPrintAlert"></div>
+    <div id="logMethodSummary"></div>
     <div id="logDayCounts"></div>
     <div id="logList"></div>
     <div class="row-2" style="margin-top:12px;">
@@ -1304,6 +1314,10 @@
   function addToQueue(record, presentStudents, opts){
     const studentsToUse = (presentStudents && presentStudents.length) ? presentStudents : record.students;
     const forceToEnd = !!(opts && opts.forceToEnd);
+    // How this car got into the queue: 'qr' (tag scanned) or 'typed' (found
+    // by name in Look Up). Stored on the entry and carried into the pickup
+    // log, so it's clear which families are already using their QR tag.
+    const addedVia = (opts && opts.source) || '';
     return mutateQueue(current => {
       if (current.some(q => q.recordId === record.id && !q.isPlaceholder)) return current; // already waiting
       const mappedStudents = studentsToUse.map(s => ({
@@ -1325,7 +1339,8 @@
           students: mappedStudents,
           addedAt: maxAddedAt + 1,
           status: 'waiting',
-          addedBySecondary: true
+          addedBySecondary: true,
+          addedVia
         });
         return current;
       }
@@ -1342,6 +1357,7 @@
         openPlaceholder.recordId = record.id;
         openPlaceholder.tagCode = record.tagCode;
         openPlaceholder.students = mappedStudents;
+        openPlaceholder.addedVia = addedVia;
         delete openPlaceholder.isPlaceholder;
         return current;
       }
@@ -1352,7 +1368,8 @@
         tagCode: record.tagCode,
         students: mappedStudents,
         addedAt: Date.now(),
-        status: 'waiting'
+        status: 'waiting',
+        addedVia
       });
       return current;
     }, 'Add car to pickup queue');
@@ -1443,6 +1460,7 @@
         typeof s === 'string' ? { name: s, grade: '' } : { name: s.name || '', grade: s.grade || '' }
       ),
       addedAt: queueEntry.addedAt || null,
+      addedVia: queueEntry.addedVia || '', // 'qr' | 'typed' | 'walkup' | '' (before this was tracked)
       pickedUpAt: Date.now()
     };
     appendToLog(entry).catch(e => console.error('Pickup log error', e));
@@ -1518,6 +1536,59 @@
     }
   }
 
+  // ---------------- Student search (Look Up + Add rider) ----------------
+  // Matches the way a phone's contact search does: each word you type has to
+  // match the START of a name word, not just appear somewhere inside the line.
+  //   - "an" finds Ana and Anthony, not Dylan or Brandon
+  //   - accents and apostrophes are ignored ("sofia" finds Sofía, "obry" finds O'Bryan)
+  //   - hyphenated/multi-part names match on any part ("mae" finds Penny-Mae)
+  //   - grade must match exactly ("1" is not "10"; "3rd" counts as 3)
+  //   - teacher: 2 letters must be the START of their name ("gu" finds Guzman),
+  //     3+ letters can be any part of it ("zma" finds Guzman). A single letter
+  //     never matches a teacher, so "Maya C" means last initial C, and a 2-letter
+  //     first-name start like "an" doesn't pick up every Guzman/Hernandez class"
+  // Every word has to match the same student — typing two siblings' names
+  // together won't find anything, since no one student is both.
+  function searchNorm(s){
+    return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/['’`]/g, '');
+  }
+
+  function searchTokens(raw){
+    return searchNorm(raw).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  }
+
+  function gradeSearchKey(g){
+    return searchNorm(g).trim().replace(/^(\d+)(?:st|nd|rd|th)$/, '$1');
+  }
+
+  function studentMatchesTokens(s, r, tokens){
+    if (!tokens.length) return false;
+    const f = studentFields(s);
+    const nameWords = searchTokens([f.firstName, f.lastName].filter(Boolean).join(' ') || s.name || '');
+    const grade = gradeSearchKey(f.grade || (r && r.grade) || '');
+    const teacher = searchNorm(f.teacher);
+    const teacherWords = searchTokens(f.teacher);
+    return tokens.every(tok =>
+      nameWords.some(w => w.startsWith(tok)) ||
+      (grade !== '' && gradeSearchKey(tok) === grade) ||
+      (tok.length >= 2 && teacherWords.some(w => w.startsWith(tok))) ||
+      (tok.length >= 3 && teacher.includes(tok))
+    );
+  }
+
+  // null if no student on this car matches; otherwise an alphabetical sort
+  // key — the first name (then last) of the best-sorting matching student.
+  function carSearchSortKey(r, tokens){
+    let best = null;
+    (Array.isArray(r.students) ? r.students : []).forEach(s => {
+      if (!studentMatchesTokens(s, r, tokens)) return;
+      const f = studentFields(s);
+      const key = searchNorm([f.firstName, f.lastName].filter(Boolean).join(' ') || s.name || '');
+      if (best === null || key.localeCompare(best) < 0) best = key;
+    });
+    return best;
+  }
+
   // ---------------- Rendering ----------------
   function renderLookup(query, showAlreadyHandled){
     const raw = (query || '').trim();
@@ -1527,21 +1598,14 @@
       box.innerHTML = `<div class="empty-state"><strong>Ready for the next car</strong>Scan a tag, or type a student name.</div>`;
       return;
     }
-    // Split into separate words so "Maya C 4" matches a student named Maya
-    // with last initial C in grade 4, regardless of what order they're typed
-    // in — a single combined substring check would miss anything but an
-    // exact "name then phrase" phrase. The real teacher name is searchable
-    // here too (any fragment of it), even though it's never shown as-is —
-    // only its PES code ever gets displayed.
-    const tokens = raw.toLowerCase().split(/\s+/).filter(Boolean);
-    const matches = records.filter(r => {
-      return (Array.isArray(r.students) ? r.students : []).some(s => {
-        const f = studentFields(s);
-        const grade = f.grade || r.grade || '';
-        const haystack = `${studentDisplayName(s)} ${grade} ${f.teacher || ''}`.toLowerCase();
-        return tokens.every(t => haystack.includes(t));
-      });
-    });
+    // See the search helpers above for the matching rules. Results are sorted
+    // alphabetically by the matching student's first name, then last.
+    const tokens = searchTokens(raw);
+    const matches = records
+      .map(r => ({ r, key: carSearchSortKey(r, tokens) }))
+      .filter(x => x.key !== null)
+      .sort((a, b) => a.key.localeCompare(b.key) || (a.r.tagCode || '').localeCompare(b.r.tagCode || ''))
+      .map(x => x.r);
     if (matches.length === 0) {
       box.innerHTML = `
         <div class="empty-state">
@@ -1589,7 +1653,8 @@
         tagCode: '',
         students: [{ name, grade: '', isTemporary: true }],
         addedAt: Date.now(),
-        status: 'waiting'
+        status: 'waiting',
+        addedVia: 'walkup'
       });
       return current;
     }, 'Quick-add a temporary, not-on-file student to today\'s queue');
@@ -1914,19 +1979,16 @@
   // DIFFERENT car's queue entry for today only. Never touches either car's
   // permanent roster record — this only ever changes queue.json.
   function findStudentsByQuery(query){
-    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const tokens = searchTokens(query);
     if (!tokens.length) return [];
     const results = [];
     records.forEach(r => {
       (Array.isArray(r.students) ? r.students : []).forEach((s, idx) => {
-        const f = studentFields(s);
-        const grade = f.grade || r.grade || '';
-        const haystack = `${studentDisplayName(s)} ${grade}`.toLowerCase();
-        if (tokens.every(t => haystack.includes(t))) {
-          results.push({ record: r, studentIdx: idx, student: s, grade });
-        }
+        if (!studentMatchesTokens(s, r, tokens)) return;
+        results.push({ record: r, studentIdx: idx, student: s, grade: studentFields(s).grade || r.grade || '' });
       });
     });
+    results.sort((a, b) => searchNorm(studentDisplayName(a.student)).localeCompare(searchNorm(studentDisplayName(b.student))));
     return results;
   }
 
@@ -2055,8 +2117,8 @@
     }
 
     const ok = isAddAfter
-      ? await addToQueue(record, studentsToAdd, { forceToEnd: true })
-      : await addToQueue(record, studentsToAdd);
+      ? await addToQueue(record, studentsToAdd, { forceToEnd: true, source: 'typed' })
+      : await addToQueue(record, studentsToAdd, { source: 'typed' });
 
     if (!ok) {
       // The write didn't actually go through — put the button back so it's
@@ -2921,7 +2983,7 @@
     const names = present.map(st => studentDisplayName(st)).concat(riders.map(r => r.name)).join(', ');
 
     $('#scanReviewConfirmBtn').disabled = true;
-    const ok = await addToQueue(record, present, { extraRiders: riders });
+    const ok = await addToQueue(record, present, { extraRiders: riders, source: 'qr' });
     if (!ok) { $('#scanReviewConfirmBtn').disabled = false; return; } // mutateQueue already said why — stay here to retry
     endScanReview();
     const toast = $('#scanToast');
@@ -3042,7 +3104,7 @@
       openScanReview(record);
       return;
     }
-    addToQueue(record);
+    addToQueue(record, null, { source: 'qr' });
     toast.className = 'scan-toast show';
     toast.textContent = `✅ Added ${names} to the queue.`;
   }
@@ -3415,11 +3477,48 @@
   // Entries for the current day/range with grade filter + sort applied,
   // BEFORE the "only unprinted" filter — the banner counts from this set so
   // it can still say how many are flagged while the filter is on.
-  function gradeSortedLogEntries(){
-    const base = logViewMode === 'day'
+  // ---- How each pickup entered the queue: 'qr' | 'typed' | 'walkup' | '' ----
+  // '' means it happened before entry method was being recorded — shown as
+  // "Not recorded" rather than guessed at.
+  function methodLabel(m){
+    return m === 'qr' ? 'QR scan' : m === 'typed' ? 'Typed in' : m === 'walkup' ? 'Walk-up' : 'Not recorded';
+  }
+
+  function methodBadgeHtml(m){
+    if (m === 'qr') return ' <span class="method-badge method-qr">📷 QR scan</span>';
+    if (m === 'typed') return ' <span class="method-badge method-typed">⌨️ Typed in</span>';
+    if (m === 'walkup') return ' <span class="method-badge method-walkup">📝 Walk-up</span>';
+    return '';
+  }
+
+  function logBaseEntries(){
+    return logViewMode === 'day'
       ? entriesForDate(cachedLog, $('#logDateInput').value)
       : entriesInRange(cachedLog, logRangeStart, logRangeEnd);
-    return applyLogGradeAndSort(base);
+  }
+
+  // Per family: how many pickups were scanned vs typed vs unrecorded, across
+  // everything in the day/range. Deliberately ignores the grade filter, so a
+  // family that scanned on a trip where the 5th grader stayed home still
+  // counts as having used its QR.
+  function methodStatsByFamily(){
+    const map = new Map();
+    logBaseEntries().forEach(e => {
+      if (!e.tagCode) return; // walk-ups have no family to classify
+      if (!map.has(e.tagCode)) map.set(e.tagCode, { qr: 0, typed: 0, unknown: 0 });
+      const st = map.get(e.tagCode);
+      if (e.addedVia === 'qr') st.qr++; else if (e.addedVia === 'typed') st.typed++; else st.unknown++;
+    });
+    return map;
+  }
+
+  function methodFileTag(){
+    const m = $('#logMethodFilter').value;
+    return m === 'typed' ? '-typed-only' : m === 'qr' ? '-used-qr' : '';
+  }
+
+  function gradeSortedLogEntries(){
+    return applyLogGradeAndSort(logBaseEntries());
   }
 
   function unprintedCodesInView(){
@@ -3428,10 +3527,44 @@
   }
 
   function currentLogEntries(){
-    const out = gradeSortedLogEntries();
-    if (!$('#logUnprintedOnly').checked) return out;
-    const unprinted = unprintedTagCodeSet();
-    return out.filter(e => unprinted.has(e.tagCode));
+    let out = gradeSortedLogEntries();
+    if ($('#logUnprintedOnly').checked) {
+      const unprinted = unprintedTagCodeSet();
+      out = out.filter(e => unprinted.has(e.tagCode));
+    }
+    const mf = $('#logMethodFilter').value;
+    if (mf) {
+      const stats = methodStatsByFamily();
+      out = out.filter(e => {
+        const st = stats.get(e.tagCode);
+        if (!st) return false;
+        return mf === 'typed' ? (st.typed > 0 && st.qr === 0) : st.qr > 0;
+      });
+    }
+    return out;
+  }
+
+  // One line answering "how are people getting in?" for what's on screen.
+  function renderMethodSummary(){
+    const box = $('#logMethodSummary');
+    const view = gradeSortedLogEntries();
+    if (!view.length) { box.innerHTML = ''; return; }
+    const n = { qr: 0, typed: 0, walkup: 0, unknown: 0 };
+    view.forEach(e => { if (e.addedVia === 'qr') n.qr++; else if (e.addedVia === 'typed') n.typed++; else if (e.addedVia === 'walkup') n.walkup++; else n.unknown++; });
+    const stats = methodStatsByFamily();
+    let usedQr = 0, typedOnly = 0;
+    new Set(view.map(e => e.tagCode).filter(Boolean)).forEach(code => {
+      const st = stats.get(code);
+      if (!st) return;
+      if (st.qr > 0) usedQr++; else if (st.typed > 0) typedOnly++;
+    });
+    const parts = [];
+    if (n.qr) parts.push(`📷 ${n.qr} QR scan${n.qr===1?'':'s'}`);
+    if (n.typed) parts.push(`⌨️ ${n.typed} typed in`);
+    if (n.walkup) parts.push(`📝 ${n.walkup} walk-up${n.walkup===1?'':'s'}`);
+    if (n.unknown) parts.push(`${n.unknown} not recorded`);
+    box.innerHTML = `<div class="hint" style="margin:6px 0;"><strong>How they entered:</strong> ${parts.join(' · ')}.` +
+      ((usedQr || typedOnly) ? ` <strong>Families:</strong> ${usedQr} ha${usedQr===1?'s':'ve'} used QR · ${typedOnly} typed only (no QR scan yet).` : '') + `</div>`;
   }
 
   function renderPrintAlert(entryCount, unprintedFamilies){
@@ -3473,6 +3606,7 @@
     const rosterByCode = new Map();
     (records || []).forEach(r => { if (r.tagCode) rosterByCode.set(r.tagCode, r); });
     const unprintedSet = unprintedTagCodeSet();
+    const methodStats = methodStatsByFamily();
     const map = new Map();
     entries.forEach(e => {
       const code = e.tagCode || '';
@@ -3489,7 +3623,7 @@
       const children = onRoster
         ? rec.students.map(st => ({ name: studentDisplayName(st), grade: studentFields(st).grade || rec.grade || '' }))
         : Array.from(f.seen.values());
-      return { tagCode: f.tagCode, onRoster, tagUnprinted: unprintedSet.has(f.tagCode), children, count: f.count, lastPickedUpAt: f.lastPickedUpAt };
+      return { tagCode: f.tagCode, onRoster, tagUnprinted: unprintedSet.has(f.tagCode), methods: methodStats.get(f.tagCode) || { qr: 0, typed: 0, unknown: 0 }, children, count: f.count, lastPickedUpAt: f.lastPickedUpAt };
     });
     const byGrade = $('#logSortSelect').value === 'grade';
     const lowKey = fam => Math.min(...fam.children.map(c => gradeSortKey(c.grade)), 999);
@@ -3497,6 +3631,14 @@
     return list.sort((a, b) =>
       byGrade ? ((lowKey(a) - lowKey(b)) || firstName(a).localeCompare(firstName(b))) : firstName(a).localeCompare(firstName(b))
     );
+  }
+
+  function familyMethodBadges(f){
+    const m = f.methods || { qr: 0, typed: 0 };
+    let out = '';
+    if (m.qr) out += ` <span class="method-badge method-qr">📷 QR ×${m.qr}</span>`;
+    if (m.typed) out += ` <span class="method-badge method-typed">⌨️ Typed ×${m.typed}${m.qr ? '' : ' — no QR scan yet'}</span>`;
+    return out;
   }
 
   function familyChildrenText(fam){
@@ -3510,6 +3652,7 @@
     const unprintedSet = unprintedTagCodeSet();
     const NOT_PRINTED_BADGE = ' <span class="print-badge print-badge-never">🖨️ Tag not printed</span>';
     renderPrintAlert(gradeSortedLogEntries().length, unprintedCodesInView());
+    renderMethodSummary();
 
     if (logViewMode === 'day') {
       const dateStr = $('#logDateInput').value;
@@ -3520,7 +3663,7 @@
       $('#logList').innerHTML = entries.map(e => `
         <div class="history-row">
           <div class="hist-msg">${escapeHtml(logEntryStudentsText(e))}</div>
-          <div class="hist-meta">${escapeHtml(e.tagCode || '')} · picked up ${new Date(e.pickedUpAt).toLocaleTimeString()}${unprintedSet.has(e.tagCode) ? NOT_PRINTED_BADGE : ''}</div>
+          <div class="hist-meta">${escapeHtml(e.tagCode || '')} · picked up ${new Date(e.pickedUpAt).toLocaleTimeString()}${methodBadgeHtml(e.addedVia)}${unprintedSet.has(e.tagCode) ? NOT_PRINTED_BADGE : ''}</div>
         </div>
       `).join('');
       $('#logExportBtn').textContent = '⬇️ Export this view (CSV)';
@@ -3554,7 +3697,7 @@
         ${fams.map(f => `
           <div class="history-row">
             <div class="hist-msg">${escapeHtml(familyChildrenText(f))}</div>
-            <div class="hist-meta">Family ${f.tagCode ? escapeHtml(f.tagCode) : '(not on file)'}${f.tagCode && !f.onRoster ? ' (no longer on roster)' : ''} · ${f.count} pickup${f.count===1?'':'s'} this range · most recent ${new Date(f.lastPickedUpAt).toLocaleDateString()}${f.tagUnprinted ? NOT_PRINTED_BADGE : ''}</div>
+            <div class="hist-meta">Family ${f.tagCode ? escapeHtml(f.tagCode) : '(not on file)'}${f.tagCode && !f.onRoster ? ' (no longer on roster)' : ''} · ${f.count} pickup${f.count===1?'':'s'} this range · most recent ${new Date(f.lastPickedUpAt).toLocaleDateString()}${familyMethodBadges(f)}${f.tagUnprinted ? NOT_PRINTED_BADGE : ''}</div>
           </div>
         `).join('')}
       `;
@@ -3573,6 +3716,8 @@
     $('#logDayCounts').innerHTML = '';
     $('#logPrintAlert').innerHTML = '';
     $('#logUnprintedOnly').checked = false;
+    $('#logMethodFilter').value = '';
+    $('#logMethodSummary').innerHTML = '';
     try {
       const { data } = await ghGetFile(LOG_PATH);
       cachedLog = Array.isArray(data) ? data : [];
@@ -3599,6 +3744,7 @@
   });
   $('#logGradeFilter').addEventListener('change', renderLog);
   $('#logUnprintedOnly').addEventListener('change', renderLog);
+  $('#logMethodFilter').addEventListener('change', renderLog);
   $('#logPrintAlert').addEventListener('click', async (e) => {
     if (e.target.id !== 'logPrintUnprintedBtn') return;
     const codes = unprintedCodesInView();
@@ -3633,10 +3779,10 @@
   $('#logExportBtn').addEventListener('click', () => {
     const entries = currentLogEntries();
     const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
-    const filenameSuffix = (logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`) + gradeTag + ($('#logUnprintedOnly').checked ? '-unprinted' : '');
+    const filenameSuffix = (logViewMode === 'day' ? $('#logDateInput').value : `${logRangeStart}_to_${logRangeEnd}`) + gradeTag + ($('#logUnprintedOnly').checked ? '-unprinted' : '') + methodFileTag();
     if (!entries.length) { alert('Nothing logged for that view — nothing to export.'); return; }
     const printedStatus = makePrintedStatusFn();
-    const rows = [['Date', 'Tag Code', 'Students', 'Added to queue', 'Picked up', 'Tag Printed']];
+    const rows = [['Date', 'Tag Code', 'Students', 'Added to queue', 'Picked up', 'Entry Method', 'Tag Printed']];
     entries.forEach(e => {
       rows.push([
         localDateInputValue(new Date(e.pickedUpAt)),
@@ -3644,6 +3790,7 @@
         logEntryStudentsText(e),
         e.addedAt ? new Date(e.addedAt).toLocaleTimeString() : '',
         new Date(e.pickedUpAt).toLocaleTimeString(),
+        methodLabel(e.addedVia),
         printedStatus(e.tagCode)
       ]);
     });
@@ -3656,8 +3803,9 @@
     const fams = uniqueFamiliesInRange(entries);
     if (!fams.length) { alert('Nothing to export for that range.'); return; }
     const printedStatus = makePrintedStatusFn();
-    const rows = [['Family Code', 'Students', 'Grades', 'Times Picked Up', 'Most Recent Pickup Date', 'On Roster', 'Tag Printed']];
+    const rows = [['Family Code', 'Students', 'Grades', 'Times Picked Up', 'Most Recent Pickup Date', 'On Roster', 'QR Pickups', 'Typed Pickups', 'Has Used QR', 'Tag Printed']];
     fams.forEach(f => {
+      const m = f.methods || { qr: 0, typed: 0 };
       rows.push([
         f.tagCode || '',
         f.children.map(c => c.name).join('; '),
@@ -3665,12 +3813,15 @@
         f.count,
         localDateInputValue(new Date(f.lastPickedUpAt)),
         f.onRoster ? 'Yes' : 'No',
+        m.qr,
+        m.typed,
+        m.qr > 0 ? 'Yes' : (m.typed > 0 ? 'No' : 'Unknown'),
         printedStatus(f.tagCode)
       ]);
     });
     const csv = rows.map(r => r.map(csvField).join(',')).join('\r\n');
     const gradeTag = $('#logGradeFilter').value ? `-grade-${$('#logGradeFilter').value.replace(/[^a-z0-9]/g, '')}` : '';
-    downloadCsv(`pickup-log-unique-families-${logRangeStart}_to_${logRangeEnd}${gradeTag}${$('#logUnprintedOnly').checked ? '-unprinted' : ''}.csv`, csv);
+    downloadCsv(`pickup-log-unique-families-${logRangeStart}_to_${logRangeEnd}${gradeTag}${$('#logUnprintedOnly').checked ? '-unprinted' : ''}${methodFileTag()}.csv`, csv);
   });
 
   $('#logClearAllBtn').addEventListener('click', async () => {
