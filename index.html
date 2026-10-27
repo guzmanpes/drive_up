@@ -485,7 +485,11 @@
   .camera-sheet.reviewing #cameraHint,
   .camera-sheet.reviewing #cameraStatus,
   .camera-sheet.reviewing .scan-review-toggle,
-  .camera-sheet.reviewing #scanToast{display:none;}
+  .camera-sheet.reviewing #scanToast,
+  .camera-sheet.reviewing #cameraControls{display:none !important;}
+  .camera-controls{display:flex;gap:12px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+  .camera-zoom{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;flex:1;min-width:160px;}
+  .camera-zoom input{flex:1;}
   .camera-frame{
     position:relative;background:#000;border-radius:12px;overflow:hidden;
     aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;
@@ -596,6 +600,13 @@
         <button class="btn-small" id="clearSelectionBtn">Clear selection</button>
         <button class="btn-small" id="printSelectedBtn">🖨️ Print selected</button>
       </div>
+    </div>
+    <div class="print-since-row">
+      <label>Digital QR images (for email, text, or ClassDojo)</label>
+      <div class="row-2">
+        <button class="btn-small" id="digitalQrBtn">📲 Download QR images (ZIP)</button>
+      </div>
+      <label class="scan-review-toggle" style="margin:6px 0 0;"><input type="checkbox" id="qrNamesToggle"> Include first names under the code</label>
     </div>
     <input class="filter" id="rosterFilter" placeholder="Search by family code, student, or grade…" />
     <div id="rosterList"></div>
@@ -724,6 +735,10 @@
       <div class="camera-guide"></div>
     </div>
     <canvas id="cameraCanvas" style="display:none;"></canvas>
+    <div class="camera-controls" id="cameraControls" style="display:none;">
+      <button type="button" class="btn-small" id="cameraTorchBtn" style="display:none;">🔦 Light: off</button>
+      <label class="camera-zoom" id="cameraZoomWrap" style="display:none;">🔍 Zoom <input type="range" id="cameraZoom" min="1" max="1" step="0.1" value="1"></label>
+    </div>
     <p class="hint" id="cameraHint"></p>
     <label class="scan-review-toggle"><input type="checkbox" id="scanReviewToggle"> Review each scan before adding</label>
     <div id="cameraStatus">Point the camera at a tag…</div>
@@ -1718,6 +1733,8 @@
     const n = selectedRosterIds.size;
     $('#printSelectedRow').style.display = n ? 'block' : 'none';
     $('#printSelectedLabel').textContent = `${n} selected`;
+    const qrBtn = $('#digitalQrBtn');
+    if (qrBtn && !qrBtn.disabled) qrBtn.textContent = n ? `📲 QR images for ${n} selected (ZIP)` : '📲 Download QR images (ZIP)';
   }
 
   function renderRoster(filterText){
@@ -1780,6 +1797,7 @@
         </div>
         <div class="row-actions">
           <button class="btn-tagrow" data-tag-id="${r.id}">🏷️ Tag</button>
+          <button class="btn-tagrow" data-qr-id="${r.id}">📲 QR image</button>
           <button class="edit" data-id="${r.id}">Edit</button>
           <button class="del" data-id="${r.id}">Delete</button>
         </div>`;
@@ -2174,6 +2192,12 @@
     if (tagId) {
       const r = records.find(x => x.id === tagId);
       if (r) printTags([r]);
+      return;
+    }
+    const qrId = e.target.dataset.qrId;
+    if (qrId) {
+      const r = records.find(x => x.id === qrId);
+      if (r) shareQrImage(r); // must run straight from the tap so iPhones allow the share sheet
       return;
     }
     const id = e.target.dataset.id;
@@ -2919,6 +2943,73 @@
   const video = $('#cameraVideo');
   const canvas = $('#cameraCanvas');
 
+  // ---- How tags get read ----
+  // Reading a printed code through a car window is the hard case: the code is
+  // small in the picture, a little out of focus, and the sensor is noisy in
+  // shade or behind tinted glass. The reader (jsQR) copes with blur OR noise,
+  // but often fails when a frame has both. So each frame is tried several ways:
+  //   1. the phone's own built-in QR reader, where the browser has one (Chrome
+  //      on Android) — much better at small, tilted, blurry codes
+  //   2. a half-size copy of the frame (averaging 2x2 pixels washes out camera
+  //      noise — in testing this rescued most blurry/noisy frames)
+  //   3. the full-resolution frame, every other pass, for codes that are far
+  //      away and so need every pixel they can get
+  let barcodeDetector = null, nativeFailures = 0;
+  try { if ('BarcodeDetector' in window) barcodeDetector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) { barcodeDetector = null; }
+  let scanBusy = false, scanTick = 0, scanStartedAt = 0, scanHintShown = false;
+  let fullCtx = null, halfCanvas = null, halfCtx = null;
+
+  async function detectNative(){
+    if (!barcodeDetector) return null;
+    try {
+      // never let a stuck native call freeze scanning
+      const codes = await Promise.race([barcodeDetector.detect(video), new Promise(res => setTimeout(() => res('timeout'), 700))]);
+      if (codes === 'timeout') { nativeFailures++; }
+      else { nativeFailures = 0; if (codes && codes.length && codes[0].rawValue) return codes[0].rawValue; return null; }
+    } catch (e) { nativeFailures++; }
+    if (nativeFailures >= 3) barcodeDetector = null; // it isn't working on this phone — stop trying
+    return null;
+  }
+
+  function decodeWithJsQr(tick){
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const hw = Math.max(1, vw >> 1), hh = Math.max(1, vh >> 1);
+    if (!halfCanvas) halfCanvas = document.createElement('canvas');
+    if (halfCanvas.width !== hw || halfCanvas.height !== hh) { halfCanvas.width = hw; halfCanvas.height = hh; halfCtx = null; }
+    if (!halfCtx) halfCtx = halfCanvas.getContext('2d', { willReadFrequently: true });
+    halfCtx.drawImage(video, 0, 0, hw, hh);
+    const hd = halfCtx.getImageData(0, 0, hw, hh);
+    // normal dark-on-light tags are the norm; every 6th pass also tries inverted
+    let r = jsQR(hd.data, hw, hh, { inversionAttempts: tick % 6 === 0 ? 'attemptBoth' : 'dontInvert' });
+    if (!r && tick % 2 === 0) {
+      if (canvas.width !== vw || canvas.height !== vh) { canvas.width = vw; canvas.height = vh; fullCtx = null; }
+      if (!fullCtx) fullCtx = canvas.getContext('2d', { willReadFrequently: true });
+      fullCtx.drawImage(video, 0, 0, vw, vh);
+      const fd = fullCtx.getImageData(0, 0, vw, vh);
+      r = jsQR(fd.data, vw, vh, { inversionAttempts: 'dontInvert' });
+    }
+    return r && r.data ? r.data : null;
+  }
+
+  async function scanOnce(){
+    const tick = scanTick++;
+    let text = null;
+    if (barcodeDetector) text = await detectNative();
+    if (!text && (!barcodeDetector || tick % 2 === 0)) text = decodeWithJsQr(tick);
+    if (text && scanLoopActive) handleScannedCode(String(text).trim());
+  }
+
+  function noteCameraNotReading(){
+    // After a few quiet seconds, say what actually helps instead of leaving
+    // staff pointing at a tag that isn't going to read.
+    if (scanHintShown || scanReviewActive || !scanStartedAt) return;
+    if (Date.now() - scanStartedAt < 6000) return;
+    scanHintShown = true;
+    const st = $('#cameraStatus');
+    st.className = '';
+    st.textContent = 'Not reading? Move a little closer, hold steady, and angle the phone to avoid glare on the tag. If the buttons above show, try the Zoom slider or the Light.';
+  }
+
   // Review step: after a scan, pause and show who's in the car so a missing
   // rider / absent sibling can be fixed BEFORE it goes in the queue (the
   // checkboxes, midday default, and Add rider were added after the original
@@ -2930,8 +3021,8 @@
 
   function updateCameraHint(){
     $('#cameraHint').textContent = scanReviewMode
-      ? 'Hold the printed tag inside the box. After each scan you\'ll see the family so you can check who\'s riding before it\'s added — then it goes right back to scanning.'
-      : 'Hold the printed tag inside the box. It adds to the queue automatically the moment it\'s recognized — keep scanning the next car right after.';
+      ? 'Aim at the tag and hold steady — closer is better. After each scan you\'ll see the family so you can check who\'s riding before it\'s added, then it goes right back to scanning.'
+      : 'Aim at the tag and hold steady — closer is better. It adds to the queue automatically the moment it\'s recognized — keep scanning the next car right after.';
     $('#scanReviewToggle').checked = scanReviewMode;
   }
 
@@ -3025,11 +3116,13 @@
     }
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false
       });
       video.srcObject = cameraStream;
       video.style.display = 'block';
+      await setupCameraControls();
+      scanStartedAt = Date.now(); scanHintShown = false;
       scanLoopActive = true;
       requestAnimationFrame(scanFrame);
     } catch (e) {
@@ -3039,7 +3132,61 @@
     }
   }
 
+  // Autofocus / zoom / light, on phones whose browser lets a page use them
+  // (mainly Android Chrome — iPhones hide these, so nothing extra shows there).
+  // Zoom is the big one for tags that are across a car dashboard: it puts
+  // more pixels on the code.
+  let cameraTrack = null, torchOn = false;
+  const ZOOM_KEY = 'carline_zoom_v1';
+
+  async function setupCameraControls(){
+    cameraTrack = (cameraStream && cameraStream.getVideoTracks) ? (cameraStream.getVideoTracks()[0] || null) : null;
+    torchOn = false;
+    $('#cameraControls').style.display = 'none';
+    $('#cameraTorchBtn').style.display = 'none';
+    $('#cameraTorchBtn').textContent = '🔦 Light: off';
+    $('#cameraZoomWrap').style.display = 'none';
+    if (!cameraTrack || !cameraTrack.getCapabilities) return;
+    let caps = {};
+    try { caps = cameraTrack.getCapabilities() || {}; } catch (e) { caps = {}; }
+
+    // A lot of "blurry" reads are just the camera not refocusing as the car moves.
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+      try { await cameraTrack.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (e) {}
+    }
+    let any = false;
+    if (caps.torch) { $('#cameraTorchBtn').style.display = 'inline-block'; any = true; }
+    if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+      const z = $('#cameraZoom');
+      z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1;
+      let saved = parseFloat(localStorage.getItem(ZOOM_KEY));
+      if (!Number.isFinite(saved)) saved = caps.zoom.min;
+      saved = Math.min(caps.zoom.max, Math.max(caps.zoom.min, saved));
+      z.value = saved;
+      try { await cameraTrack.applyConstraints({ advanced: [{ zoom: saved }] }); } catch (e) {}
+      $('#cameraZoomWrap').style.display = 'flex';
+      any = true;
+    }
+    if (any) $('#cameraControls').style.display = 'flex';
+  }
+
+  $('#cameraZoom').addEventListener('input', async (e) => {
+    const v = parseFloat(e.target.value);
+    if (!cameraTrack || !Number.isFinite(v)) return;
+    try { await cameraTrack.applyConstraints({ advanced: [{ zoom: v }] }); localStorage.setItem(ZOOM_KEY, String(v)); } catch (err) {}
+  });
+
+  $('#cameraTorchBtn').addEventListener('click', async () => {
+    if (!cameraTrack) return;
+    try {
+      await cameraTrack.applyConstraints({ advanced: [{ torch: !torchOn }] });
+      torchOn = !torchOn;
+      $('#cameraTorchBtn').textContent = torchOn ? '🔦 Light: on' : '🔦 Light: off';
+    } catch (err) {}
+  });
+
   function stopCameraStream(){
+    cameraTrack = null; torchOn = false;
     if (cameraStream) {
       cameraStream.getTracks().forEach(t => t.stop());
       cameraStream = null;
@@ -3067,20 +3214,17 @@
 
   function scanFrame(){
     if (!scanLoopActive) return;
-    if (!scanReviewActive && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const found = jsQR(imageData.data, imageData.width, imageData.height);
-      if (found && found.data) handleScannedCode(found.data.trim());
+    if (!scanReviewActive && !scanBusy && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth) {
+      scanBusy = true;
+      scanOnce().catch(e => console.error('scan pass failed', e)).finally(() => { scanBusy = false; });
     }
+    noteCameraNotReading();
     requestAnimationFrame(scanFrame);
   }
 
   function handleScannedCode(text){
     if (scanReviewActive) return; // paused while someone is reviewing a family
+    scanStartedAt = Date.now(); scanHintShown = false;
     const now = Date.now();
     if (text === lastScanCode && (now - lastScanTime) < 2500) return; // ignore the same tag held in view
     lastScanCode = text; lastScanTime = now;
@@ -3165,7 +3309,7 @@
       // popup to load its own copy of the library (more fragile on mobile).
       const qrDataUrls = await Promise.all(list.map((r) => new Promise((resolve, reject) => {
         const tmp = document.createElement('canvas');
-        QRCode.toCanvas(tmp, r.tagCode, { width: 300, margin: 1 }, (err) => {
+        QRCode.toCanvas(tmp, r.tagCode, { width: 300, margin: 1, errorCorrectionLevel: 'H' }, (err) => {
           if (err) return reject(err);
           resolve(tmp.toDataURL('image/png'));
         });
@@ -3198,6 +3342,176 @@
       alert('Could not generate the tags to print. ' + (e && e.message ? e.message : 'Please try again.'));
     }
   }
+
+  // ---------------- Digital QR images (email / text / ClassDojo) ----------------
+  // Built for a code that will be shown on a phone screen and read by another
+  // phone's camera. Choices, and why (all tested):
+  //   - squares drawn at a whole number of pixels, pure black on pure white,
+  //     so edges stay razor sharp instead of smoothing into gray
+  //   - the standard 4-square blank margin, and fully opaque white (no
+  //     transparency, so an email app's dark mode can't turn it inside out)
+  //   - the strongest error correction (same size as the weaker settings) —
+  //     it's what helps when screen glare washes out part of the code
+  //   - ~1000px wide. Email/text shrinking and heavy JPEG compression did not
+  //     affect it in testing, even down to 150px wide
+  //   - the caption sits below the code's blank margin, never inside it
+  const QR_IMG_MIN_WIDTH = 1000;
+  const QR_NAMES_KEY = 'carline_qr_names_v1';
+  $('#qrNamesToggle').checked = localStorage.getItem(QR_NAMES_KEY) === 'on';
+  $('#qrNamesToggle').addEventListener('change', (e) => localStorage.setItem(QR_NAMES_KEY, e.target.checked ? 'on' : 'off'));
+
+  function qrCardCanvas(record, includeNames){
+    const qr = QRCode.create(record.tagCode, { errorCorrectionLevel: 'H' });
+    const n = qr.modules.size, bits = qr.modules.data, quiet = 4, total = n + quiet * 2;
+    const px = Math.ceil(QR_IMG_MIN_WIDTH / total), side = px * total;
+
+    const names = includeNames
+      ? (Array.isArray(record.students) ? record.students : []).map(st => studentDisplayName(st)).join(', ')
+      : '';
+    const lines = [{ text: record.tagCode, kind: 'code' }];
+    if (names) lines.push({ text: names, kind: 'names' });
+    lines.push({ text: 'Show this at pickup', kind: 'info' }, { text: 'Turn your screen brightness up', kind: 'tip' });
+    const capH = Math.round(px * (2.5 + 1.25 * (lines.length - 1) + 0.4));
+
+    const cv = document.createElement('canvas');
+    cv.width = side; cv.height = side + capH;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height);
+
+    ctx.fillStyle = '#000000';
+    for (let y = 0; y < n; y++) {           // one rectangle per run of dark squares
+      let x = 0;
+      while (x < n) {
+        if (bits[y * n + x]) { let x2 = x; while (x2 < n && bits[y * n + x2]) x2++; ctx.fillRect((x + quiet) * px, (y + quiet) * px, (x2 - x) * px, px); x = x2; }
+        else x++;
+      }
+    }
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    let yPos = side + px * 1.95;
+    lines.forEach((ln, i) => {
+      if (ln.kind === 'code') { ctx.font = `700 ${Math.round(px * 1.9)}px ui-monospace, Menlo, Consolas, monospace`; ctx.fillStyle = '#000000'; }
+      else if (ln.kind === 'names') { ctx.font = `600 ${Math.round(px * 0.85)}px system-ui, -apple-system, Helvetica, Arial, sans-serif`; ctx.fillStyle = '#222222'; }
+      else if (ln.kind === 'info') { ctx.font = `600 ${Math.round(px * 0.8)}px system-ui, -apple-system, Helvetica, Arial, sans-serif`; ctx.fillStyle = '#222222'; }
+      else { ctx.font = `500 ${Math.round(px * 0.65)}px system-ui, -apple-system, Helvetica, Arial, sans-serif`; ctx.fillStyle = '#555555'; }
+      let text = ln.text;
+      if (ln.kind === 'names') { while (text.length > 4 && ctx.measureText(text).width > side * 0.92) text = text.slice(0, -2).trimEnd() + '…'; }
+      ctx.fillText(text, side / 2, yPos);
+      yPos += px * (i === 0 ? 1.4 : 1.15);
+    });
+
+    ctx.strokeStyle = '#d0d0d0'; ctx.lineWidth = 4;      // hairline frame so it holds its shape on a white page
+    ctx.strokeRect(2, 2, cv.width - 4, cv.height - 4);
+    return cv;
+  }
+
+  function dataUrlToBytes(url){
+    const bin = atob(url.split(',')[1]);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function qrFileName(record){
+    const st = (Array.isArray(record.students) && record.students[0]) ? studentFields(record.students[0]) : null;
+    const clean = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const who = st ? [clean(st.firstName), clean(String(st.lastName || '').charAt(0))].filter(Boolean).join('-') : '';
+    return `QR_${clean(record.tagCode)}${who ? '_' + who : ''}.png`;
+  }
+
+  // Synchronous on purpose: iPhones only open the share sheet when it's
+  // requested straight from the tap, so nothing here can wait on a promise.
+  function qrCardBytes(record){
+    return dataUrlToBytes(qrCardCanvas(record, $('#qrNamesToggle').checked).toDataURL('image/png'));
+  }
+
+  function downloadBlob(filename, blob){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  // One family: opens the phone's share sheet (Messages, Mail, AirDrop…) where
+  // the browser supports sharing a file — iPhones do — otherwise downloads it.
+  async function shareQrImage(record){
+    if (!record.tagCode) { alert('This car doesn\'t have a family code yet. Tap Sync (top of the app) so it gets one, then try again.'); return; }
+    const file = new File([qrCardBytes(record)], qrFileName(record), { type: 'image/png' });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Pickup QR code' });
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return; // they closed the share sheet — nothing to do
+    }
+    downloadBlob(file.name, file);
+  }
+
+  // ---- minimal ZIP writer (stored, no compression — PNGs are already compressed) ----
+  const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+  function crc32(bytes){ let c = 0xFFFFFFFF; for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+  function makeZip(files){
+    const enc = new TextEncoder(), now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const parts = [], central = []; let offset = 0;
+    files.forEach(f => {
+      const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+      lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true); lh.setUint32(14, crc, true);
+      lh.setUint32(18, size, true); lh.setUint32(22, size, true); lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+      parts.push(new Uint8Array(lh.buffer), name, f.data);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+      ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true); ch.setUint32(16, crc, true);
+      ch.setUint32(20, size, true); ch.setUint32(24, size, true); ch.setUint16(28, name.length, true);
+      ch.setUint32(42, offset, true);
+      central.push(new Uint8Array(ch.buffer), name);
+      offset += 30 + name.length + size;
+    });
+    const cdSize = central.reduce((a, c) => a + c.length, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+    const all = parts.concat(central, [new Uint8Array(end.buffer)]);
+    const out = new Uint8Array(all.reduce((a, c) => a + c.length, 0));
+    let pos = 0; all.forEach(c => { out.set(c, pos); pos += c.length; });
+    return out;
+  }
+
+  // Everyone (or just the checked families) as one ZIP: a PNG per family plus
+  // an INDEX.csv so a file can be matched to its family.
+  $('#digitalQrBtn').addEventListener('click', async () => {
+    const chosen = selectedRosterIds.size ? records.filter(r => selectedRosterIds.has(r.id)) : records.slice();
+    const list = chosen.filter(r => r.tagCode);
+    if (!list.length) { alert('Nothing to export — no cars with a family code.'); return; }
+    const skipped = chosen.length - list.length;
+    if (!confirm(`Create QR images for ${list.length} famil${list.length===1?'y':'ies'}${selectedRosterIds.size ? ' (the ones you checked)' : ''}?${skipped ? `\n\n(${skipped} car${skipped===1?' has':'s have'} no family code yet and will be skipped.)` : ''}`)) return;
+
+    const btn = $('#digitalQrBtn');
+    btn.disabled = true;
+    try {
+      const files = [], rows = [['Family Code', 'Students', 'File']];
+      for (let i = 0; i < list.length; i++) {
+        const r = list[i], name = qrFileName(r);
+        files.push({ name, data: qrCardBytes(r) });
+        rows.push([r.tagCode, (Array.isArray(r.students) ? r.students : []).map(st => { const f = studentFields(st); return f.grade ? `${studentDisplayName(st)} (${f.grade})` : studentDisplayName(st); }).join('; '), name]);
+        if (i % 12 === 11) { btn.textContent = `Creating ${i + 1} of ${list.length}…`; await new Promise(res => setTimeout(res, 0)); }
+      }
+      files.push({ name: 'INDEX.csv', data: new TextEncoder().encode(rows.map(row => row.map(csvField).join(',')).join('\r\n')) });
+      downloadBlob(`digital-qr-images-${new Date().toISOString().slice(0, 10)}.zip`, new Blob([makeZip(files)], { type: 'application/zip' }));
+    } catch (e) {
+      console.error(e);
+      alert('Could not create the images: ' + (e.message || e));
+    } finally {
+      btn.disabled = false;
+      updateSelectionUI();
+    }
+  });
 
   $('#printAllTagsBtn').addEventListener('click', () => printTags(records));
 
