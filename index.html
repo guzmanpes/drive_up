@@ -707,6 +707,13 @@
     </div>
 
     <div class="card">
+      <h3>Connection check</h3>
+      <p class="hint">If scans say "Tag not recognized" or the roster looks empty, run this. It checks whether this phone can reach your data on GitHub, how many cars are saved there vs. on this phone, and whether your family codes changed in a recent save.</p>
+      <button class="btn btn-secondary" id="connCheckBtn">🔍 Check connection &amp; roster</button>
+      <div id="connCheckResult" style="margin-top:10px;font-size:13.5px;line-height:1.55;"></div>
+    </div>
+
+    <div class="card">
       <h3>Pickup log</h3>
       <p class="hint">A running record of every "Picked up" tap — separate from the queue itself, so there's an actual answer to "who left, and when" after the fact. Tapping "Clear all" or excluding an absent sibling doesn't add anything here, since those aren't confirmed pickups.</p>
       <button class="btn btn-secondary" id="viewLogBtn">📋 View pickup log</button>
@@ -883,6 +890,7 @@
   let teacherCodesSha = null;
 
   let settings = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+  let lastSyncedAt = 0; // when the roster was last successfully read from GitHub
   let records = JSON.parse(localStorage.getItem(CACHE_KEY) || '[]'); // [{id,tagCode,students:[{firstName,lastName,studentId,grade}],contactName,notes,createdAt,updatedAt}]
   let currentSha = null;
 
@@ -1185,9 +1193,28 @@
     if (showBusy) setSync('busy', 'Syncing…');
     try {
       const { data, sha } = await ghGetFile(DATA_PATH);
+      // GitHub says "not found" (sha === null) for a genuinely missing file —
+      // but ALSO when the repo or branch name is wrong, or when the token has
+      // lost access to a private repo. If this phone already has a roster,
+      // believing "not found" would wipe it (and its saved copy) and every
+      // tag would then read as "not recognized". So keep what we have.
+      if (sha === null) {
+        if (records.length > 0) {
+          setSync('err', `Can't find ${DATA_PATH} on GitHub — keeping this phone's saved list. Settings → Check connection.`);
+        } else {
+          setSync('err', `No roster found on GitHub (${DATA_PATH} not found). Settings → Check connection.`);
+        }
+        return;
+      }
+      if (!Array.isArray(data)) {
+        setSync('err', `${DATA_PATH} on GitHub isn't a list of cars — keeping this phone's saved list. Settings → Check connection.`);
+        return;
+      }
       records = data; currentSha = sha;
       localStorage.setItem(CACHE_KEY, JSON.stringify(records));
-      setSync('ok', `Synced · ${records.length} car${records.length===1?'':'s'} on file`);
+      lastSyncedAt = Date.now();
+      if (records.length === 0) setSync('err', 'Connected, but the roster on GitHub is empty (0 cars) — every tag will read as "not recognized". Settings → Check connection.');
+      else setSync('ok', `Synced · ${records.length} car${records.length===1?'':'s'} on file`);
       renderAll();
       if (records.some(r => !r.tagCode || !r.createdAt)) {
         await mutateRoster(fresh => {
@@ -3185,9 +3212,19 @@
       : { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } };
   }
 
+  // Tags can only be matched against the roster, so say so up front if this
+  // phone doesn't have one (not signed in, or the list didn't load).
+  function rosterWarning(){
+    if (!settings || !settings.token) return 'This phone isn\'t signed in, so it can\'t match tags to families. Close this and open Settings → Paste connection info (private browsing forgets the sign-in).';
+    if (records.length === 0) return 'This phone has no roster loaded, so tags won\'t match. Close this and check the sync status at the top, or Settings → Check connection.';
+    return '';
+  }
+
   async function openCamera(){
     resetCameraUI();
     $('#cameraOverlay').classList.add('active');
+    const warning = rosterWarning();
+    if (warning) { $('#cameraStatus').className = 'err'; $('#cameraStatus').textContent = warning; }
     if (typeof jsQR === 'undefined') {
       $('#cameraStatus').className = 'err';
       $('#cameraStatus').textContent = 'The tag scanner failed to load. Try reloading the page, or use manual lookup instead.';
@@ -3200,7 +3237,7 @@
       // Start reading RIGHT AWAY. Nothing else that talks to the camera
       // hardware (focus, zoom, light) is allowed to hold scanning up — if a
       // phone's browser stalls on one of those, tags still have to read.
-      scanStartedAt = Date.now(); scanHintShown = false;
+      scanStartedAt = Date.now(); scanHintShown = !!warning; // a roster warning stays on screen; don't bury it under the usual tips
       scanPasses = 0; enhancedErrors = 0; scanBusy = false; scanPassStartedAt = 0;
       scanWindowStart = Date.now(); scanPassesWindow = 0;
       scanLoopActive = true;
@@ -3320,11 +3357,20 @@
     if (text === lastScanCode && (now - lastScanTime) < 2500) return; // ignore the same tag held in view
     lastScanCode = text; lastScanTime = now;
 
-    const record = records.find(r => r.tagCode === text);
+    const normCode = v => String(v == null ? '' : v).trim().toUpperCase();
+    const record = records.find(r => normCode(r.tagCode) === normCode(text));
     const toast = $('#scanToast');
     if (!record) {
+      // Say what was read and what this phone has, so "not recognized" can be
+      // told apart: an empty/stale roster vs. a code that isn't on file.
+      const shown = String(text).length > 40 ? String(text).slice(0, 40) + '…' : String(text);
+      const ago = lastSyncedAt ? ` (last synced ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 60000))} min ago)` : '';
       toast.className = 'scan-toast show miss';
-      toast.textContent = `Tag not recognized — it isn't on the roster.`;
+      toast.textContent = (!settings || !settings.token)
+        ? `Tag read ("${shown}") but this phone isn't signed in, so it has no roster to match against. Open Settings and tap Paste connection info (or Save & connect). Private browsing forgets the sign-in.`
+        : records.length === 0
+        ? `Tag read ("${shown}") but this phone has NO roster loaded. Check the sync status at the top, then Settings → Check connection.`
+        : `Tag read ("${shown}") but no family on file has that code. This phone has ${records.length} cars loaded${ago}.`;
       return;
     }
     const names = record.students.map(s => studentDisplayName(s)).join(', ');
@@ -3711,6 +3757,98 @@
   function closeHistory(){
     $('#historyOverlay').classList.remove('active');
   }
+
+  // ---------------- Connection check ----------------
+  async function probeStatus(url){
+    try {
+      const res = await fetch(url, { headers: { 'Authorization': `Bearer ${settings.token}`, 'Accept': 'application/vnd.github+json' } });
+      return { status: res.status, res };
+    } catch (e) {
+      return { status: 0, error: (e && e.message) || String(e) };
+    }
+  }
+
+  async function runConnectionCheck(){
+    const box = $('#connCheckResult');
+    const rows = [];
+    const add = (icon, html) => rows.push(`<div style="margin-bottom:6px;">${icon} ${html}</div>`);
+    const show = () => { box.innerHTML = rows.join(''); };
+    if (!settings || !settings.owner || !settings.repo || !settings.token) {
+      add('❌', 'This phone isn\'t connected yet — fill in the connection form above and tap Save &amp; connect.');
+      show(); return;
+    }
+    box.innerHTML = 'Checking…';
+    const who = `${escapeHtml(settings.owner)}/${escapeHtml(settings.repo)}`;
+    add('ℹ️', `Connected to <strong>${who}</strong>, branch <strong>${escapeHtml(settings.branch || 'main')}</strong>.`);
+
+    // 1) Can the token see the repo at all?
+    const repo = await probeStatus(`https://api.github.com/repos/${settings.owner}/${settings.repo}`);
+    if (repo.status === 200) add('✅', 'GitHub accepts the access token and can see the repo.');
+    else if (repo.status === 401) add('❌', '<strong>GitHub rejected the access token</strong> — it has expired, been revoked, or was mistyped. Create a new token (Contents: read and write, on this repo) and paste it into the connection form above.');
+    else if (repo.status === 403) add('⚠️', 'GitHub refused the request (403) — usually a rate limit, or a token missing the Contents permission. Wait a few minutes and run this again; if it keeps happening, create a new token.');
+    else if (repo.status === 404) add('❌', `<strong>GitHub can't find ${who} with this token.</strong> Either the owner/repo name is wrong, or the token no longer has access to this private repo. This is what makes every tag read as "not recognized".`);
+    else add('❌', `Couldn't reach GitHub${repo.error ? ' (' + escapeHtml(repo.error) + ')' : ''}. Check the internet connection — some school Wi-Fi blocks GitHub; try cellular.`);
+    if (repo.status !== 200) { show(); return; }
+
+    // 2) Is the roster file there, and how many cars are in it?
+    const file = await probeStatus(`${apiBase(DATA_PATH)}?ref=${encodeURIComponent(settings.branch)}&t=${Date.now()}`);
+    let remote = null;
+    if (file.status === 404) {
+      add('❌', `The repo is reachable, but <strong>${DATA_PATH} isn't on branch "${escapeHtml(settings.branch)}"</strong> — the branch name is wrong, or the file was deleted or renamed.`);
+    } else if (file.status !== 200) {
+      add('❌', `Couldn't read ${DATA_PATH} (HTTP ${file.status}).`);
+    } else {
+      try {
+        const json = await file.res.json();
+        const text = decodeURIComponent(escape(atob(json.content.replace(/\n/g, '')))).trim();
+        remote = text ? JSON.parse(text) : [];
+      } catch (e) { add('❌', `${DATA_PATH} on GitHub can't be read as a list of cars — open it on github.com and check that it holds valid data.`); }
+    }
+    if (Array.isArray(remote)) {
+      const codes = remote.map(r => r && r.tagCode).filter(Boolean);
+      if (!remote.length) add('❌', `<strong>The roster on GitHub is empty (0 cars).</strong> That's why every tag reads as "not recognized". See the saves below for when it was emptied — Recent changes can restore an earlier version.`);
+      else add('✅', `GitHub's roster has <strong>${remote.length} cars</strong> (${codes.length} with family codes). Example codes: <code>${escapeHtml(codes.slice(0, 5).join(', '))}</code>`);
+      if (records.length !== remote.length) add('⚠️', `This phone has <strong>${records.length} cars</strong> loaded, but GitHub has ${remote.length}. Tap <strong>Sync</strong> (top of the app) to refresh this phone.`);
+      else add('✅', `This phone has the same number of cars loaded (${records.length}).`);
+    }
+    show();
+
+    // 3) Did a recent save change the family codes? (the thing that silently breaks printed tags)
+    try {
+      const commits = await ghGetCommitHistory(DATA_PATH, 6);
+      if (commits.length) {
+        const versions = [];
+        for (const c of commits) versions.push({ c, list: await ghGetFileAtCommit(DATA_PATH, c.sha) });
+        const codeSet = list => new Set((Array.isArray(list) ? list : []).map(r => r && r.tagCode).filter(Boolean));
+        add('📜', '<strong>Recent saves to the roster</strong> (newest first) — a ⚠️ marks a save that changed family codes:');
+        versions.forEach((v, i) => {
+          const set = codeSet(v.list), older = versions[i + 1];
+          let note = '';
+          if (older) {
+            const prev = codeSet(older.list);
+            const added = [...set].filter(x => !prev.has(x)).length, gone = [...prev].filter(x => !set.has(x)).length;
+            const changed = Math.max(added, gone);
+            note = changed === 0 ? ' · codes unchanged' : (changed / Math.max(1, prev.size) > 0.05
+              ? ` · ⚠️ <strong>${gone} codes disappeared, ${added} new codes appeared</strong>`
+              : ` · ${changed} code${changed===1?'':'s'} changed`);
+          }
+          add('•', `${escapeHtml(new Date(v.c.date).toLocaleString())} — “${escapeHtml((v.c.message || '').slice(0, 70))}” — ${(Array.isArray(v.list) ? v.list.length : 0)} cars${note}`);
+        });
+        add('ℹ️', 'If a ⚠️ save is where your printed tags stopped matching, open <strong>Recent changes</strong> and restore the save just <em>before</em> it.');
+      }
+    } catch (e) {
+      add('ℹ️', 'Couldn\'t load the save history right now.');
+    }
+    show();
+  }
+
+  $('#connCheckBtn').addEventListener('click', async () => {
+    const btn = $('#connCheckBtn');
+    btn.disabled = true;
+    try { await runConnectionCheck(); }
+    catch (e) { console.error(e); $('#connCheckResult').textContent = 'The check itself failed: ' + (e.message || e); }
+    finally { btn.disabled = false; }
+  });
 
   $('#viewHistoryBtn').addEventListener('click', openHistory);
   $('#closeHistoryBtn').addEventListener('click', closeHistory);
