@@ -485,10 +485,13 @@
   .camera-sheet.reviewing #cameraHint,
   .camera-sheet.reviewing #cameraStatus,
   .camera-sheet.reviewing .scan-review-toggle,
+  .camera-sheet.reviewing #cameraBackup,
   .camera-sheet.reviewing #scanToast,
   .camera-sheet.reviewing #cameraDiag,
   .camera-sheet.reviewing #scannerEnhancedToggle,
   .camera-sheet.reviewing #cameraControls{display:none !important;}
+  .scan-backup{background:#FFF8E6;border:1.5px dashed var(--vest-ink);border-radius:10px;padding:10px;margin-top:8px;}
+  .scan-backup input{font-family:monospace;font-size:17px;letter-spacing:2px;text-transform:uppercase;}
   .camera-controls{display:flex;gap:12px;align-items:center;margin-top:8px;flex-wrap:wrap;}
   .camera-zoom{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;flex:1;min-width:160px;}
   .camera-zoom input{flex:1;}
@@ -769,6 +772,14 @@
     <label class="scan-review-toggle"><input type="checkbox" id="scannerEnhancedToggle"> Enhanced scanner (beta) — try it when the line is quiet</label>
     <div id="cameraDiag" style="font-size:11.5px;color:var(--muted);margin-top:4px;"></div>
     <div id="cameraStatus">Point the camera at a tag…</div>
+    <div class="scan-backup" id="cameraBackup" style="display:none;">
+      <div class="hint" style="font-weight:700;margin:0 0 6px;">Won't scan? Type the code printed on the tag:</div>
+      <div class="row-2">
+        <input id="backupCodeInput" type="text" placeholder="e.g. MGP5ZX" maxlength="16" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+        <button class="btn-small" id="backupCodeBtn" type="button">Add</button>
+      </div>
+      <button class="btn-ghost" id="backupNameBtn" type="button" style="margin-top:6px;">Search by name instead</button>
+    </div>
     <div class="scan-toast" id="scanToast"></div>
     <div class="row-2" style="margin-top:12px;">
       <button class="btn btn-secondary" id="closeCameraBtn2">Done scanning</button>
@@ -3101,7 +3112,52 @@
     if (text && scanLoopActive) handleScannedCode(String(text).trim());
   }
 
+  // Backup for a tag that won't scan: after 5 quiet seconds, offer a box to
+  // type the code printed on the tag (reliable, and needs nothing extra), or to
+  // switch to searching by name. A typed code goes through the exact same path
+  // as a scan — including the review step — but is logged as "typed in", so
+  // the pickup log can still show which families' QR codes aren't working.
+  let scanBackupShown = false;
+  function showScanBackup(){ scanBackupShown = true; $('#cameraBackup').style.display = 'block'; }
+  function hideScanBackup(){ scanBackupShown = false; $('#cameraBackup').style.display = 'none'; }
+
+  function submitBackupCode(){
+    const input = $('#backupCodeInput');
+    const code = input.value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    if (!code) return;
+    input.value = '';
+    input.blur(); // put the keyboard away so the family check is visible
+    const norm = v => String(v == null ? '' : v).trim().toUpperCase();
+    const exact = records.find(r => norm(r.tagCode) === code);
+    if (!exact) {
+      // A single wrong character is the usual typo (5 vs S, a slipped key).
+      // Suggest the one family it could be — but only if there's exactly one,
+      // and they still confirm the names on the review screen afterward.
+      const near = records.filter(r => {
+        const c = norm(r.tagCode);
+        if (c.length !== code.length) return false;
+        let diff = 0;
+        for (let i = 0; i < c.length; i++) if (c[i] !== code[i] && ++diff > 1) return false;
+        return diff === 1;
+      });
+      if (near.length === 1) {
+        const names = (Array.isArray(near[0].students) ? near[0].students : []).map(st => studentDisplayName(st)).join(', ');
+        if (confirm(`No family has the code "${code}". Did you mean ${near[0].tagCode} (${names})?`)) { handleScannedCode(norm(near[0].tagCode), 'typed'); return; }
+      }
+    }
+    handleScannedCode(code, 'typed');
+  }
+
+  $('#backupCodeBtn').addEventListener('click', submitBackupCode);
+  $('#backupCodeInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitBackupCode(); } });
+  $('#backupNameBtn').addEventListener('click', () => {
+    closeCamera();
+    switchView('lookup');
+    setTimeout(() => $('#plateInput').focus(), 80);
+  });
+
   function noteCameraNotReading(){
+    if (!scanBackupShown && !scanReviewActive && scanStartedAt && Date.now() - scanStartedAt >= 5000 && !rosterWarning()) showScanBackup();
     // After a few quiet seconds, say what actually helps instead of leaving
     // staff pointing at a tag that isn't going to read.
     if (scanHintShown || scanReviewActive || !scanStartedAt) return;
@@ -3109,7 +3165,7 @@
     scanHintShown = true;
     const st = $('#cameraStatus');
     st.className = '';
-    st.textContent = 'Not reading? Move a little closer, hold steady, and angle the phone to avoid glare on the tag. If the buttons above show, try the Zoom slider or the Light.';
+    st.textContent = 'Not reading? Move a little closer, hold steady, and angle the phone to avoid glare on the tag. If the buttons above show, try the Zoom slider or the Light. Or type the code from the tag in the box below.';
   }
 
   // Review step: after a scan, pause and show who's in the car so a missing
@@ -3146,8 +3202,8 @@
       </div>`).join('');
   }
 
-  function openScanReview(record){
-    scanPending = { record, riders: [] };
+  function openScanReview(record, via){
+    scanPending = { record, riders: [], via: via || 'qr' };
     scanReviewActive = true;
     document.querySelector('#cameraOverlay .camera-sheet').classList.add('reviewing');
     $('#scanReview').style.display = 'block';
@@ -3169,7 +3225,7 @@
 
   async function confirmScanReview(){
     if (!scanPending) return;
-    const { record, riders } = scanPending;
+    const { record, riders, via } = scanPending;
     const boxes = Array.from(document.querySelectorAll('#scanReviewList .lookup-student-check'));
     const checkedIdx = boxes.filter(b => b.checked).map(b => Number(b.dataset.studentIdx));
     if (!checkedIdx.length) { alert('Check at least one student before adding this car to the queue.'); return; }
@@ -3177,7 +3233,7 @@
     const names = present.map(st => studentDisplayName(st)).concat(riders.map(r => r.name)).join(', ');
 
     $('#scanReviewConfirmBtn').disabled = true;
-    const ok = await addToQueue(record, present, { extraRiders: riders, source: 'qr' });
+    const ok = await addToQueue(record, present, { extraRiders: riders, source: via || 'qr' });
     if (!ok) { $('#scanReviewConfirmBtn').disabled = false; return; } // mutateQueue already said why — stay here to retry
     endScanReview();
     const toast = $('#scanToast');
@@ -3339,6 +3395,8 @@
 
   function resetCameraUI(){
     resetScanReviewState();
+    hideScanBackup();
+    $('#backupCodeInput').value = '';
     updateCameraHint();
     video.style.display = 'block';
     $('#cameraStatus').className = '';
@@ -3368,9 +3426,10 @@
     requestAnimationFrame(scanFrame);
   }
 
-  function handleScannedCode(text){
+  function handleScannedCode(text, via){
     if (scanReviewActive) return; // paused while someone is reviewing a family
-    scanStartedAt = Date.now(); scanHintShown = false;
+    via = via || 'qr'; // 'qr' = tag scanned; 'typed' = code typed from the tag
+    scanStartedAt = Date.now(); scanHintShown = false; hideScanBackup();
     const now = Date.now();
     if (text === lastScanCode && (now - lastScanTime) < 2500) return; // ignore the same tag held in view
     lastScanCode = text; lastScanTime = now;
@@ -3382,13 +3441,14 @@
       // Say what was read and what this phone has, so "not recognized" can be
       // told apart: an empty/stale roster vs. a code that isn't on file.
       const shown = String(text).length > 40 ? String(text).slice(0, 40) + '…' : String(text);
+      const readWord = via === 'typed' ? 'Code typed' : 'Tag read';
       const ago = lastSyncedAt ? ` (last synced ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 60000))} min ago)` : '';
       toast.className = 'scan-toast show miss';
       toast.textContent = (!settings || !settings.token)
-        ? `Tag read ("${shown}") but this phone isn't signed in, so it has no roster to match against. Open Settings and tap Paste connection info (or Save & connect). Private browsing forgets the sign-in.`
+        ? `${readWord} ("${shown}") but this phone isn't signed in, so it has no roster to match against. Open Settings and tap Paste connection info (or Save & connect). Private browsing forgets the sign-in.`
         : records.length === 0
-        ? `Tag read ("${shown}") but this phone has NO roster loaded. Check the sync status at the top, then Settings → Check connection.`
-        : `Tag read ("${shown}") but no family on file has that code. This phone has ${records.length} cars loaded${ago}.`;
+        ? `${readWord} ("${shown}") but this phone has NO roster loaded. Check the sync status at the top, then Settings → Check connection.`
+        : `${readWord} ("${shown}") but no family on file has that code.${via === 'typed' ? ' Check the code printed on the tag.' : ''} This phone has ${records.length} cars loaded${ago}.`;
       return;
     }
     const names = record.students.map(s => studentDisplayName(s)).join(', ');
@@ -3400,10 +3460,10 @@
     if (scanReviewMode) {
       toast.className = 'scan-toast';
       toast.textContent = '';
-      openScanReview(record);
+      openScanReview(record, via);
       return;
     }
-    addToQueue(record, null, { source: 'qr' });
+    addToQueue(record, null, { source: via });
     toast.className = 'scan-toast show';
     toast.textContent = `✅ Added ${names} to the queue.`;
   }
@@ -3422,7 +3482,7 @@
         <div class="tag-students">${escapeHtml(names)}</div>
         ${grades ? `<div class="tag-grade">${escapeHtml(grades)}</div>` : ''}
         <div class="tag-code">${r.tagCode || ''}</div>
-        <div class="tag-label">Place on dashboard</div>
+        <div class="tag-label">Show to staff member</div>
       </div>
     </div>`;
   }
@@ -3525,7 +3585,7 @@
       : '';
     const lines = [{ text: record.tagCode, kind: 'code' }];
     if (names) lines.push({ text: names, kind: 'names' });
-    lines.push({ text: 'Show this at pickup', kind: 'info' }, { text: 'Turn your screen brightness up', kind: 'tip' });
+    lines.push({ text: 'Show to staff member', kind: 'info' }, { text: 'Turn your screen brightness up', kind: 'tip' });
     const capH = Math.round(px * (2.5 + 1.25 * (lines.length - 1) + 0.4));
 
     const cv = document.createElement('canvas');
