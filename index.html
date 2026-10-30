@@ -401,6 +401,7 @@
     cursor:pointer;padding:0 2px;vertical-align:middle;
   }
   .queue-info .meta{font-size:12px;color:var(--muted);font-family:'Barlow Condensed',sans-serif;}
+  .queue-info .midday-note{font-size:12.5px;font-weight:600;color:var(--teal);margin-top:3px;}
   .queue-actions{display:flex;flex-direction:column;gap:6px;}
   .queue-row .done-btn{
     background:var(--good);color:#fff;border:none;border-radius:8px;
@@ -1385,7 +1386,20 @@
   }
 
   function addToQueue(record, presentStudents, opts){
-    const studentsToUse = (presentStudents && presentStudents.length) ? presentStudents : record.students;
+    // Who goes in the line. A choice made on the review screen or Look Up
+    // card wins. With no choice (a scan with review turned off), students
+    // marked 🕐 midday are left out — the same starting point the review step
+    // uses — because they're picked up earlier and never at the end of the day.
+    const allStudents = Array.isArray(record.students) ? record.students : [];
+    const isMidday = st => !!studentFields(st).skipEndOfDayPickup;
+    let studentsToUse = (presentStudents && presentStudents.length) ? presentStudents : allStudents.filter(st => !isMidday(st));
+    if (!studentsToUse.length) studentsToUse = allStudents; // never create an empty entry
+    // Midday students who were left out are NOTED on the entry (not called as
+    // pickups). A midday student who's been added back as a rider isn't noted.
+    const riderNames = new Set(((opts && opts.extraRiders) || []).map(r => r.name));
+    const middayNoted = allStudents
+      .filter(st => isMidday(st) && !studentsToUse.includes(st) && !riderNames.has(studentDisplayName(st)))
+      .map(st => ({ name: studentDisplayName(st), grade: studentFields(st).grade || record.grade || '' }));
     const forceToEnd = !!(opts && opts.forceToEnd);
     // How this car got into the queue: 'qr' (tag scanned) or 'typed' (found
     // by name in Look Up). Stored on the entry and carried into the pickup
@@ -1413,7 +1427,8 @@
           addedAt: maxAddedAt + 1,
           status: 'waiting',
           addedBySecondary: true,
-          addedVia
+          addedVia,
+          ...(middayNoted.length ? { middayStudents: middayNoted } : {})
         });
         return current;
       }
@@ -1431,6 +1446,7 @@
         openPlaceholder.tagCode = record.tagCode;
         openPlaceholder.students = mappedStudents;
         openPlaceholder.addedVia = addedVia;
+        if (middayNoted.length) openPlaceholder.middayStudents = middayNoted; else delete openPlaceholder.middayStudents;
         delete openPlaceholder.isPlaceholder;
         return current;
       }
@@ -1442,7 +1458,8 @@
         students: mappedStudents,
         addedAt: Date.now(),
         status: 'waiting',
-        addedVia
+        addedVia,
+        ...(middayNoted.length ? { middayStudents: middayNoted } : {})
       });
       return current;
     }, 'Add car to pickup queue');
@@ -1945,6 +1962,14 @@
   // Doesn't touch the roster; only shown when there's more than one student
   // on the entry, since removing your only remaining one isn't the right
   // tool (that's what "Picked up" or "Parked" already covers).
+  // The midday students on a car who are NOT in the line today — shown as a
+  // note so staff know they exist and aren't waiting to be called.
+  function middayNoteHtml(q){
+    const m = q && q.middayStudents;
+    if (!Array.isArray(m) || !m.length) return '';
+    return `<div class="midday-note">🕐 Midday, not in line: ${m.map(x => escapeHtml(x.name) + (x.grade ? ` (${escapeHtml(x.grade)})` : '')).join(', ')}</div>`;
+  }
+
   function formatQueueStudentsInteractive(q){
     const students = q.students || [];
     if (students.length <= 1) return formatQueueStudents(students);
@@ -1999,6 +2024,7 @@
         <div class="queue-pos">${i+1}</div>
         <div class="queue-info">
           <div class="students">${formatQueueStudentsInteractive(q)}${q.addedBySecondary ? '<span class="secondary-tag">2nd adder</span>' : ''}</div>
+          ${middayNoteHtml(q)}
           <div class="meta">${escapeHtml(q.tagCode || '')} · ${timeAgo(q.addedAt)}</div>
         </div>
         <div class="queue-actions">
@@ -2020,6 +2046,7 @@
         <div class="queue-pos">🅿️</div>
         <div class="queue-info">
           <div class="students">${formatQueueStudentsInteractive(q)}</div>
+          ${middayNoteHtml(q)}
           <div class="meta">${escapeHtml(q.tagCode || '')} · parked ${timeAgo(q.addedAt)}</div>
         </div>
         <div class="queue-actions">
@@ -2111,6 +2138,11 @@
       if (!e) return current;
       if (!Array.isArray(e.students)) e.students = [];
       e.students.push({ ...rider });
+      // a midday student added back to the line is no longer just "noted"
+      if (Array.isArray(e.middayStudents)) {
+        e.middayStudents = e.middayStudents.filter(m => m.name !== rider.name);
+        if (!e.middayStudents.length) delete e.middayStudents;
+      }
       return current;
     }, 'Add a temporary rider to today\'s queue entry');
   }
@@ -3208,8 +3240,11 @@
     document.querySelector('#cameraOverlay .camera-sheet').classList.add('reviewing');
     $('#scanReview').style.display = 'block';
     $('#scanReviewCode').textContent = 'Family ' + (record.tagCode || '');
-    $('#scanReviewBanner').innerHTML = todaysPickedUpTagCodes.has(record.tagCode)
-      ? '<div class="hint" style="font-weight:700;color:var(--good);">✅ Already picked up today — adding again means a second pickup.</div>' : '';
+    const midKids = (record.students || []).filter(st => studentFields(st).skipEndOfDayPickup);
+    $('#scanReviewBanner').innerHTML = (todaysPickedUpTagCodes.has(record.tagCode)
+      ? '<div class="hint" style="font-weight:700;color:var(--good);">✅ Already picked up today — adding again means a second pickup.</div>' : '') +
+      (midKids.length
+        ? `<div class="hint" style="font-weight:700;color:var(--teal);">🕐 ${midKids.length === (record.students || []).length ? 'Every student on this car is marked midday' : 'Midday students start unchecked'} — check anyone who needs end-of-day pickup today.</div>` : '');
     $('#scanReviewList').innerHTML = (record.students || []).map((s, idx) => studentCheckLineHtml(s, idx, record.grade)).join('');
     $('#scanReviewConfirmBtn').disabled = false;
     renderScanRiders();
@@ -3457,15 +3492,22 @@
       toast.textContent = `${names} is already in the queue.`;
       return;
     }
-    if (scanReviewMode) {
+    const everyStudent = Array.isArray(record.students) ? record.students : [];
+    const middayKids = everyStudent.filter(st => studentFields(st).skipEndOfDayPickup);
+    const onlyMidday = everyStudent.length > 0 && middayKids.length === everyStudent.length;
+    // Review turned on — or nobody on this car is a normal end-of-day pickup
+    // (adding nobody would be silent and adding a midday student would be
+    // wrong) — so let a person decide on the review screen.
+    if (scanReviewMode || onlyMidday) {
       toast.className = 'scan-toast';
       toast.textContent = '';
       openScanReview(record, via);
       return;
     }
     addToQueue(record, null, { source: via });
+    const addedNames = everyStudent.filter(st => !studentFields(st).skipEndOfDayPickup).map(st => studentDisplayName(st)).join(', ');
     toast.className = 'scan-toast show';
-    toast.textContent = `✅ Added ${names} to the queue.`;
+    toast.textContent = `✅ Added ${addedNames} to the queue.` + (middayKids.length ? ` 🕐 ${middayKids.map(st => studentDisplayName(st)).join(', ')} — midday, not added.` : '');
   }
 
   $('#openCameraBtn').addEventListener('click', openCamera);
