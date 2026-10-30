@@ -487,6 +487,7 @@
   .camera-sheet.reviewing #cameraStatus,
   .camera-sheet.reviewing .scan-review-toggle,
   .camera-sheet.reviewing #cameraBackup,
+  .camera-sheet.reviewing #cameraHelpBtn,
   .camera-sheet.reviewing #scanToast,
   .camera-sheet.reviewing #cameraDiag,
   .camera-sheet.reviewing #scannerEnhancedToggle,
@@ -773,13 +774,15 @@
     <label class="scan-review-toggle"><input type="checkbox" id="scannerEnhancedToggle"> Enhanced scanner (beta) — try it when the line is quiet</label>
     <div id="cameraDiag" style="font-size:11.5px;color:var(--muted);margin-top:4px;"></div>
     <div id="cameraStatus">Point the camera at a tag…</div>
+    <button class="btn-quick-temp" id="cameraHelpBtn" type="button" style="margin-top:10px;">⌨️ Won't scan? Type the code</button>
     <div class="scan-backup" id="cameraBackup" style="display:none;">
-      <div class="hint" style="font-weight:700;margin:0 0 6px;">Won't scan? Type the code printed on the tag:</div>
+      <div class="hint" style="font-weight:700;margin:0 0 6px;">Type the code printed on the tag:</div>
       <div class="row-2">
         <input id="backupCodeInput" type="text" placeholder="e.g. MGP5ZX" maxlength="16" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
         <button class="btn-small" id="backupCodeBtn" type="button">Add</button>
       </div>
       <button class="btn-ghost" id="backupNameBtn" type="button" style="margin-top:6px;">Search by name instead</button>
+      <div class="hint" style="margin-top:8px;">Still want to scan it? Move a little closer, hold steady, and tilt the phone to avoid glare on the tag.</div>
     </div>
     <div class="scan-toast" id="scanToast"></div>
     <div class="row-2" style="margin-top:12px;">
@@ -3048,7 +3051,7 @@
   //      away and so need every pixel they can get
   let barcodeDetector = null, nativeFailures = 0;
   try { if ('BarcodeDetector' in window) barcodeDetector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) { barcodeDetector = null; }
-  let scanBusy = false, scanTick = 0, scanStartedAt = 0, scanHintShown = false;
+  let scanBusy = false, scanTick = 0;
   // Two scanners. "standard" is the original, proven loop and is the default.
   // "enhanced" (opt-in) adds the half-size/built-in-reader attempts and a
   // bigger picture. If enhanced throws errors or stalls, it switches itself
@@ -3150,8 +3153,17 @@
   // as a scan — including the review step — but is logged as "typed in", so
   // the pickup log can still show which families' QR codes aren't working.
   let scanBackupShown = false;
-  function showScanBackup(){ scanBackupShown = true; $('#cameraBackup').style.display = 'block'; }
-  function hideScanBackup(){ scanBackupShown = false; $('#cameraBackup').style.display = 'none'; }
+  function showScanBackup(){ scanBackupShown = true; $('#cameraBackup').style.display = 'block'; $('#cameraHelpBtn').textContent = '✖ Close the code box'; }
+  function hideScanBackup(){ scanBackupShown = false; $('#cameraBackup').style.display = 'none'; $('#cameraHelpBtn').textContent = '⌨️ Won\'t scan? Type the code'; }
+
+  // On demand: staff tap it the moment a tag won't read — no waiting on a timer.
+  // focus() has to happen right here in the tap (not after a delay) or iPhones
+  // won't bring up the keyboard.
+  $('#cameraHelpBtn').addEventListener('click', () => {
+    if (scanBackupShown) { hideScanBackup(); return; }
+    showScanBackup();
+    $('#backupCodeInput').focus();
+  });
 
   function submitBackupCode(){
     const input = $('#backupCodeInput');
@@ -3188,18 +3200,6 @@
     setTimeout(() => $('#plateInput').focus(), 80);
   });
 
-  function noteCameraNotReading(){
-    if (!scanBackupShown && !scanReviewActive && scanStartedAt && Date.now() - scanStartedAt >= 5000 && !rosterWarning()) showScanBackup();
-    // After a few quiet seconds, say what actually helps instead of leaving
-    // staff pointing at a tag that isn't going to read.
-    if (scanHintShown || scanReviewActive || !scanStartedAt) return;
-    if (Date.now() - scanStartedAt < 6000) return;
-    scanHintShown = true;
-    const st = $('#cameraStatus');
-    st.className = '';
-    st.textContent = 'Not reading? Move a little closer, hold steady, and angle the phone to avoid glare on the tag. If the buttons above show, try the Zoom slider or the Light. Or type the code from the tag in the box below.';
-  }
-
   // Review step: after a scan, pause and show who's in the car so a missing
   // rider / absent sibling can be fixed BEFORE it goes in the queue (the
   // checkboxes, midday default, and Add rider were added after the original
@@ -3211,8 +3211,8 @@
 
   function updateCameraHint(){
     $('#cameraHint').textContent = scanReviewMode
-      ? 'Aim at the tag and hold steady — closer is better. After each scan you\'ll see the family so you can check who\'s riding before it\'s added, then it goes right back to scanning.'
-      : 'Aim at the tag and hold steady — closer is better. It adds to the queue automatically the moment it\'s recognized — keep scanning the next car right after.';
+      ? 'Aim at the tag and hold steady — closer is better. After each scan you\'ll see the family so you can check who\'s riding before it\'s added, then it goes right back to scanning. If a tag won\'t read, tap the code button below.'
+      : 'Aim at the tag and hold steady — closer is better. It adds to the queue automatically the moment it\'s recognized — keep scanning the next car right after. If a tag won\'t read, tap the code button below.';
     $('#scanReviewToggle').checked = scanReviewMode;
     $('#scannerEnhancedToggle').checked = scannerMode === 'enhanced';
   }
@@ -3346,7 +3346,8 @@
       // Start reading RIGHT AWAY. Nothing else that talks to the camera
       // hardware (focus, zoom, light) is allowed to hold scanning up — if a
       // phone's browser stalls on one of those, tags still have to read.
-      scanStartedAt = Date.now(); scanHintShown = !!warning; // a roster warning stays on screen; don't bury it under the usual tips
+      // a phone with no roster can't match a typed code either — only offer the code box when it can
+      $('#cameraHelpBtn').style.display = warning ? 'none' : 'block';
       scanPasses = 0; enhancedErrors = 0; scanBusy = false; scanPassStartedAt = 0;
       scanWindowStart = Date.now(); scanPassesWindow = 0;
       scanLoopActive = true;
@@ -3431,6 +3432,7 @@
   function resetCameraUI(){
     resetScanReviewState();
     hideScanBackup();
+    $('#cameraHelpBtn').style.display = 'block';
     $('#backupCodeInput').value = '';
     updateCameraHint();
     video.style.display = 'block';
@@ -3457,14 +3459,13 @@
     }
     watchScannerHealth();
     updateScanDiag();
-    noteCameraNotReading();
     requestAnimationFrame(scanFrame);
   }
 
   function handleScannedCode(text, via){
     if (scanReviewActive) return; // paused while someone is reviewing a family
     via = via || 'qr'; // 'qr' = tag scanned; 'typed' = code typed from the tag
-    scanStartedAt = Date.now(); scanHintShown = false; hideScanBackup();
+    hideScanBackup();
     const now = Date.now();
     if (text === lastScanCode && (now - lastScanTime) < 2500) return; // ignore the same tag held in view
     lastScanCode = text; lastScanTime = now;
